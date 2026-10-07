@@ -43,9 +43,14 @@ int Port_Voxel_CurrentArea(void) {
 }
 void Port_Voxel_RequestShot(const char*) {
 }
+void Port_Voxel_HandleEvent(const union SDL_Event*) {
+}
+void Port_Voxel_RemapDpad(uint16_t*) {
+}
 
 #else
 
+#include <SDL3/SDL.h>
 #include <SDL3/SDL_gpu.h>
 
 #include <cpu/mode1.h>
@@ -71,8 +76,11 @@ extern "C" {
 #include "player.h"
 #include "room.h"
 #include "screen.h"
+#include "message.h"
 #undef this
+#include "port_debug_menu.h"
 #include "port_gba_mem.h"
+#include "port_imgui_menu.h"
 #include "port_widescreen.h"
 extern u16 gMapDataBottomSpecial[0x4000];
 extern u16 gMapDataTopSpecial[0x4000];
@@ -107,6 +115,73 @@ struct PortVoxelFade {
     float actors[kFadeMaxActors][4]; /* xyz feet, world space */
 };
 constexpr float kFovYDeg = 45.0f;
+
+/* Orbit camera round the scroll centre. Yaw 0 is the GBA's straight-on view;
+ * let go, it settles on the nearest 45 deg so the turned D-pad
+ * (Port_Voxel_RemapDpad) walks exactly away from / across the view. Pitch
+ * starts at the F8 value and follows it when that changes. */
+struct OrbitCam {
+    float yaw = 0.0f;   /* degrees, eye swings toward +x as it grows */
+    float pitch = 0.0f; /* degrees above the ground */
+    float dist = kDistance, distGoal = kDistance;
+    int cfgPitch = -1;
+    bool dragging = false;
+    Uint64 lastNs = 0;
+};
+OrbitCam sCam;
+constexpr float kCamMinDist = 80.0f, kCamMaxDist = 900.0f;
+constexpr float kCamMinPitch = 10.0f, kCamMaxPitch = 85.0f;
+constexpr float kCamTurnRate = 120.0f; /* deg/s, keys and stick */
+constexpr float kCamTiltRate = 60.0f;
+constexpr float kCamZoomRate = 2.0f; /* distance factor per second */
+constexpr float kCamMouseDeg = 0.3f; /* per pixel of right-drag */
+
+float SnappedYaw(void) {
+    return std::round(sCam.yaw / 45.0f) * 45.0f;
+}
+
+void ResetCam(void) {
+    sCam.yaw = 0.0f;
+    sCam.pitch = (float)Port_Config_GetVoxelPitch();
+    sCam.dist = sCam.distGoal = kDistance;
+}
+
+void UpdateCam(void) {
+    const Uint64 now = SDL_GetTicksNS();
+    const float dt = sCam.lastNs ? std::min((float)(now - sCam.lastNs) * 1e-9f, 0.1f) : 0.0f;
+    sCam.lastNs = now;
+    if (sCam.cfgPitch != Port_Config_GetVoxelPitch()) {
+        sCam.cfgPitch = Port_Config_GetVoxelPitch();
+        sCam.pitch = (float)sCam.cfgPitch;
+    }
+    float turn = 0.0f, tilt = 0.0f, zoom = 0.0f;
+    if (!Port_DebugMenu_IsOpen() && !Port_ImGui_WantsTextInput()) {
+        const bool* k = SDL_GetKeyboardState(nullptr);
+        turn = (float)k[SDL_SCANCODE_L] - (float)k[SDL_SCANCODE_J];
+        tilt = (float)k[SDL_SCANCODE_I] - (float)k[SDL_SCANCODE_K];
+        zoom = (float)k[SDL_SCANCODE_O] - (float)k[SDL_SCANCODE_U];
+    }
+    int pads = 0;
+    if (SDL_JoystickID* ids = SDL_GetGamepads(&pads)) {
+        for (int i = 0; i < pads; ++i)
+            if (SDL_Gamepad* g = SDL_GetGamepadFromID(ids[i])) {
+                const float rx = SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHTX) / 32767.0f;
+                const float ry = SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHTY) / 32767.0f;
+                if (std::fabs(rx) > 0.25f)
+                    turn += rx;
+                if (std::fabs(ry) > 0.25f)
+                    tilt -= ry;
+            }
+        SDL_free(ids);
+    }
+    sCam.yaw += turn * kCamTurnRate * dt;
+    if (turn == 0.0f && !sCam.dragging) /* ease onto the nearest 45 deg */
+        sCam.yaw += (SnappedYaw() - sCam.yaw) * std::min(1.0f, dt * 8.0f);
+    sCam.yaw = std::fmod(sCam.yaw + 540.0f, 360.0f) - 180.0f;
+    sCam.pitch = std::clamp(sCam.pitch + tilt * kCamTiltRate * dt, kCamMinPitch, kCamMaxPitch);
+    sCam.distGoal = std::clamp(sCam.distGoal * std::pow(kCamZoomRate, zoom * dt), kCamMinDist, kCamMaxDist);
+    sCam.dist += (sCam.distGoal - sCam.dist) * std::min(1.0f, dt * 10.0f);
+}
 constexpr float kTopLayerLift = 16.0f; /* lifted overhead art floats one tile up */
 
 constexpr int kMaxVerts = 6 * 512;
@@ -1371,8 +1446,14 @@ static bool PresentImpl(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swap, int swa
         sMapKey = mapKey;
     }
 
-    const float pitch = (float)Port_Config_GetVoxelPitch() * 3.14159265f / 180.0f;
-    const float upY = std::cos(pitch), upZ = -std::sin(pitch); /* billboard "up": faces the camera */
+    UpdateCam();
+    const float pitch = sCam.pitch * 3.14159265f / 180.0f;
+    const float yaw = sCam.yaw * 3.14159265f / 180.0f;
+    const float cy = std::cos(yaw), sy = std::sin(yaw);
+    /* Billboards face the camera: "right" across the view, "up" tilted back
+     * by the pitch. At yaw 0 that is world x and the GBA's own rows. */
+    const float rightX = cy, rightZ = -sy;
+    const float upX = -sy * std::sin(pitch), upY = std::cos(pitch), upZ = -cy * std::sin(pitch);
     /* Lower OAM index wins on GBA; draw high -> low so it lands last (LEQUAL). */
     for (int i = 127; i >= 0; --i) {
         const PortVoxelOamTag tag = gPortVoxelOamTags[i];
@@ -1401,10 +1482,15 @@ static bool PresentImpl(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swap, int swa
             const int foot = std::max<int>(tag.groundY, sy1);
             const float footZ = foot + scrollY, footY = elev + 0.5f;
             const float h0 = (float)(foot - sy0), h1 = (float)(foot - sy1);
-            const float d[4][3] = { { x0, footY + upY * h0, footZ + upZ * h0 },
-                                    { x1, footY + upY * h0, footZ + upZ * h0 },
-                                    { x0, footY + upY * h1, footZ + upZ * h1 },
-                                    { x1, footY + upY * h1, footZ + upZ * h1 } };
+            /* An entity's pieces turn round its anchor, so they stay together. */
+            const float ax = tag.anchorX + scrollX;
+            auto at = [&](float a, float h, float* v) {
+                v[0] = ax + rightX * a + upX * h;
+                v[1] = footY + upY * h;
+                v[2] = footZ + rightZ * a + upZ * h;
+            };
+            float d[4][3];
+            at(x0 - ax, h0, d[0]), at(x1 - ax, h0, d[1]), at(x0 - ax, h1, d[2]), at(x1 - ax, h1, d[3]);
             std::memcpy(c, d, sizeof(c));
         }
         QuadUv(sVerts, kMaxVerts, n, c, o.uv, 1, o.tile, o.pal, o.rowParam);
@@ -1611,7 +1697,8 @@ static bool PresentImpl(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swap, int swa
         /* The camera, for the fade (the 3D pass below); the shader thins
          * room geometry (kind 0) only, never the backdrop, HUD or sprites. */
         const float target3[3] = { scrollX + viewW * 0.5f, 0.0f, scrollY + 80.0f };
-        const float eye[3] = { target3[0], kDistance * std::sin(pitch), target3[2] + kDistance * std::cos(pitch) };
+        const float eye[3] = { target3[0] + sCam.dist * sy * std::cos(pitch), sCam.dist * std::sin(pitch),
+                               target3[2] + sCam.dist * cy * std::cos(pitch) };
         static PortVoxelFade fade;
         fade.cam[0] = eye[0], fade.cam[1] = eye[1], fade.cam[2] = eye[2];
         fade.cam[3] = Port_Config_GetVoxelWallFade() ? 1.0f : 0.0f;
@@ -1693,6 +1780,63 @@ bool Port_Voxel_Present(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swap, int swa
 
 bool Port_Voxel_IsDrawing(void) {
     return sDrewLastFrame;
+}
+
+void Port_Voxel_HandleEvent(const SDL_Event* e) {
+    if (!sDrewLastFrame)
+        return;
+    switch (e->type) {
+    case SDL_EVENT_MOUSE_WHEEL:
+        if (!Port_ImGui_WantsMouse())
+            sCam.distGoal = std::clamp(sCam.distGoal * std::pow(0.88f, e->wheel.y), kCamMinDist, kCamMaxDist);
+        break;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+    case SDL_EVENT_MOUSE_BUTTON_UP:
+        if (e->button.button == SDL_BUTTON_RIGHT)
+            sCam.dragging = e->type == SDL_EVENT_MOUSE_BUTTON_DOWN && !Port_ImGui_WantsMouse();
+        break;
+    case SDL_EVENT_MOUSE_MOTION:
+        if (sCam.dragging) {
+            sCam.yaw -= e->motion.xrel * kCamMouseDeg;
+            sCam.pitch = std::clamp(sCam.pitch + e->motion.yrel * kCamMouseDeg, kCamMinPitch, kCamMaxPitch);
+        }
+        break;
+    case SDL_EVENT_KEY_DOWN:
+        if (e->key.scancode == SDL_SCANCODE_H && !e->key.repeat && !Port_DebugMenu_IsOpen() &&
+            !Port_ImGui_WantsTextInput())
+            ResetCam();
+        break;
+    default:
+        break;
+    }
+}
+
+void Port_Voxel_RemapDpad(uint16_t* keyinput) {
+    /* Only while walking round a room: menus, text-box choices and the 2D
+     * view keep the plain D-pad. */
+    if (!sDrewLastFrame || !SceneApplicable() || (gMessage.state & MESSAGE_ACTIVE))
+        return;
+    const int step = ((int)std::lround(SnappedYaw() / 45.0f) % 8 + 8) % 8;
+    if (step == 0)
+        return;
+    const uint16_t k = *keyinput; /* GBA KEYINPUT: 0 = pressed */
+    const int ix = (int)!(k & DPAD_RIGHT) - (int)!(k & DPAD_LEFT);
+    const int iz = (int)!(k & DPAD_DOWN) - (int)!(k & DPAD_UP);
+    if (ix == 0 && iz == 0)
+        return;
+    /* Screen-space press -> world direction: "up" heads away from the eye. */
+    const float a = (float)step * 45.0f * 3.14159265f / 180.0f;
+    const float wx = ix * std::cos(a) + iz * std::sin(a), wz = -ix * std::sin(a) + iz * std::cos(a);
+    uint16_t out = k | DPAD_RIGHT | DPAD_LEFT | DPAD_UP | DPAD_DOWN;
+    if (wx > 0.38f)
+        out &= ~DPAD_RIGHT;
+    if (wx < -0.38f)
+        out &= ~DPAD_LEFT;
+    if (wz > 0.38f)
+        out &= ~DPAD_DOWN;
+    if (wz < -0.38f)
+        out &= ~DPAD_UP;
+    *keyinput = out;
 }
 
 void Port_Voxel_Shutdown(void) {

@@ -23,6 +23,7 @@
 #include "port_softslots.h"
 #include "port_touch_controls.h"
 #include "port_tts.h"
+#include "port_voxel.h"
 #include "rando/rando_file_menu.h"
 #include "port_level_editor.h"
 #include <SDL3/SDL.h>
@@ -144,6 +145,7 @@ static void Port_UpdateInput(void) {
             keyinput &= ~sInputMap[i].gbaMask;
         }
     }
+    Port_Voxel_RemapDpad(&keyinput); /* D-pad turns with the 3D camera */
 
     /* Soft-slots (X / Y / L2 / R2): when one is held with an item
      * assigned, force GBA B_BUTTON pressed so the engine spawns the
@@ -228,6 +230,7 @@ static void Port_PumpEvents(void) {
          * stays in sync. ImGui only consumes input when a widget is
          * actively hovered/focused; game input passes through. */
         Port_ImGui_HandleEvent(&e);
+        Port_Voxel_HandleEvent(&e); /* 3D view camera: wheel, right-drag, H */
         if (Port_LevelEditor_IsOpen()) {
             if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && !Port_ImGui_WantsTextInput()) {
                 if (Port_LevelEditor_HandleKey((int)e.key.key, (int)e.key.scancode)) {

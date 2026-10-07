@@ -46,6 +46,7 @@ typedef struct {
     int16_t trueX;   /* piece's screen position when parked; OAM x/y are */
     int16_t trueY;   /* then a placeholder off the 2D screen */
     uint8_t parked;
+    int16_t anchorX; /* screen X of the entity: its pieces turn round it */
 } PortVoxelOamTag;
 extern PortVoxelOamTag gPortVoxelOamTagsBuild[128];
 extern PortVoxelOamTag gPortVoxelOamTags[128];
@@ -56,6 +57,12 @@ void Port_Voxel_LatchOamTags(void);
 bool Port_Voxel_IsDrawing(void);
 /* Debug: write the next 3D frame (rendered offscreen, 960x540) to `path`. */
 void Port_Voxel_RequestShot(const char* path);
+/* Orbit camera: mouse wheel zooms, right-drag orbits/tilts (also J/L, I/K,
+ * U/O, gamepad right stick; H resets). Called for every SDL event. */
+union SDL_Event;
+void Port_Voxel_HandleEvent(const union SDL_Event* e);
+/* Turns the D-pad with the camera so "up" walks away from it. */
+void Port_Voxel_RemapDpad(uint16_t* keyinput);
 
 #ifdef __cplusplus
 }
