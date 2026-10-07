@@ -28,7 +28,9 @@ static void DrawRibbonDisplayTab(void) {
     const bool gpuActive = Port_GPU_IsActive();
 
     if (ImGui::BeginTable("##display_settings_table", 2, ImGuiTableFlags_SizingFixedFit)) {
-        ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+        /* Wide enough for the longest label at the current font size. */
+        ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed,
+                                ImGui::CalcTextSize("3D walls out of the way").x + ImGui::GetFontSize());
         ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
 
         // Window scale - value captured before the buttons (read-before).

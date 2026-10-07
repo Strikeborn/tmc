@@ -186,7 +186,7 @@ void UpdateCam(void) {
     sCam.dist += (sCam.distGoal - sCam.dist) * std::min(1.0f, dt * 10.0f);
 }
 constexpr float kTopLayerLift = 16.0f; /* lifted overhead art floats one tile up */
-constexpr int kFootSlack = 12; /* px of art below the feet left to sink into the floor */
+constexpr int kBossSlack = 32; /* art hanging further below the ground row stands on its bottom */
 
 constexpr int kMaxVerts = 6 * 512;
 constexpr Uint32 kVramBytes = 0x18000;
@@ -1501,29 +1501,55 @@ static bool PresentImpl(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swap, int swa
             const float d[4][3] = { { x0, y, z0 }, { x1, y, z0 }, { x0, y, z1 }, { x1, y, z1 } };
             std::memcpy(c, d, sizeof(c));
         } else {
-            /* Pixel row sy stands (foot - sy) px up the billboard. The foot is
-             * the entity's ground row, or its lowest art row when the art
-             * reaches below it (big bosses anchor at their centre), so no rows
-             * end up buried under the floor. The base moves that far toward
-             * the camera (at yaw 0, down the GBA screen, as before), the same
-             * for all of an entity's pieces so they stay in one plane. */
-            /* Small overhangs (a walk cycle's bob, padding rows) keep the base
-             * on the ground row, or the sprite hops frame to frame. */
+            /* Pixel row sy stands (groundY - sy) px up the billboard, which
+             * stands on the entity's ground row, where its shadow is. Rows
+             * below that row (feet, a sword swung down) fold flat onto the
+             * floor toward the camera: at yaw 0 that reads exactly like the
+             * GBA, and from any side they lie on the ground instead of
+             * sinking into it or lifting the entity. Entities whose art hangs
+             * far below their ground row (bosses anchored at their centre)
+             * stand on their lowest row instead, moved toward the camera. */
             const int below = entBottom[i] - tag.groundY;
-            const int foot = below > kFootSlack ? entBottom[i] : tag.groundY;
+            const int foot = below > kBossSlack ? entBottom[i] : tag.groundY;
             const float toCam = (float)(foot - tag.groundY);
             const float footZ = tag.groundY + scrollY + cy * toCam, footY = elev + 0.5f;
-            const float h0 = (float)(foot - sy0), h1 = (float)(foot - sy1);
             /* An entity's pieces turn round its anchor, so they stay together. */
             const float ax = tag.anchorX + scrollX, baseX = ax + sy * toCam;
-            auto at = [&](float a, float h, float* v) {
+            auto stand = [&](float a, int row, float* v) {
+                const float h = (float)(foot - row);
                 v[0] = baseX + rightX * a + upX * h;
                 v[1] = footY + upY * h;
                 v[2] = footZ + rightZ * a + upZ * h;
             };
-            float d[4][3];
-            at(x0 - ax, h0, d[0]), at(x1 - ax, h0, d[1]), at(x0 - ax, h1, d[2]), at(x1 - ax, h1, d[3]);
-            std::memcpy(c, d, sizeof(c));
+            auto lie = [&](float a, int row, float* v) { /* row >= foot */
+                const float t = (float)(row - foot);
+                v[0] = baseX + rightX * a + sy * t;
+                v[1] = footY;
+                v[2] = footZ + rightZ * a + cy * t;
+            };
+            const float a0 = x0 - ax, a1 = x1 - ax;
+            const int fold = std::clamp(foot, sy0, sy1);
+            const float tf = (float)(fold - sy0) / (float)(sy1 - sy0);
+            float uvFold[2][2];
+            for (int k = 0; k < 2; ++k) {
+                uvFold[0][k] = o.uv[0][k] + (o.uv[2][k] - o.uv[0][k]) * tf;
+                uvFold[1][k] = o.uv[1][k] + (o.uv[3][k] - o.uv[1][k]) * tf;
+            }
+            if (fold > sy0) { /* standing part */
+                float d[4][3];
+                stand(a0, sy0, d[0]), stand(a1, sy0, d[1]), stand(a0, fold, d[2]), stand(a1, fold, d[3]);
+                const float uv[4][2] = { { o.uv[0][0], o.uv[0][1] }, { o.uv[1][0], o.uv[1][1] },
+                                         { uvFold[0][0], uvFold[0][1] }, { uvFold[1][0], uvFold[1][1] } };
+                QuadUv(sVerts, kMaxVerts, n, d, uv, 1, o.tile, o.pal, o.rowParam);
+            }
+            if (fold < sy1) { /* lying part */
+                float d[4][3];
+                lie(a0, fold, d[0]), lie(a1, fold, d[1]), lie(a0, sy1, d[2]), lie(a1, sy1, d[3]);
+                const float uv[4][2] = { { uvFold[0][0], uvFold[0][1] }, { uvFold[1][0], uvFold[1][1] },
+                                         { o.uv[2][0], o.uv[2][1] }, { o.uv[3][0], o.uv[3][1] } };
+                QuadUv(sVerts, kMaxVerts, n, d, uv, 1, o.tile, o.pal, o.rowParam);
+            }
+            continue;
         }
         QuadUv(sVerts, kMaxVerts, n, c, o.uv, 1, o.tile, o.pal, o.rowParam);
     }
