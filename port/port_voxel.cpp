@@ -186,6 +186,7 @@ void UpdateCam(void) {
     sCam.dist += (sCam.distGoal - sCam.dist) * std::min(1.0f, dt * 10.0f);
 }
 constexpr float kTopLayerLift = 16.0f; /* lifted overhead art floats one tile up */
+constexpr int kFootSlack = 12; /* px of art below the feet left to sink into the floor */
 
 constexpr int kMaxVerts = 6 * 512;
 constexpr Uint32 kVramBytes = 0x18000;
@@ -1500,19 +1501,23 @@ static bool PresentImpl(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swap, int swa
             const float d[4][3] = { { x0, y, z0 }, { x1, y, z0 }, { x0, y, z1 }, { x1, y, z1 } };
             std::memcpy(c, d, sizeof(c));
         } else {
-            /* The billboard stands on the entity's ground row, where its
-             * shadow is. Pixel row sy is (foot - sy) px up it, with foot the
-             * entity's lowest art row when that reaches below the ground (big
-             * bosses anchor at their centre): the whole entity is lifted so
-             * no rows are buried, and its pieces stay in one plane. */
-            const int foot = std::max<int>(tag.groundY, entBottom[i]);
-            const float footZ = tag.groundY + scrollY;
-            const float footY = elev + 0.5f + (float)(foot - tag.groundY) * upY;
+            /* Pixel row sy stands (foot - sy) px up the billboard. The foot is
+             * the entity's ground row, or its lowest art row when the art
+             * reaches below it (big bosses anchor at their centre), so no rows
+             * end up buried under the floor. The base moves that far toward
+             * the camera (at yaw 0, down the GBA screen, as before), the same
+             * for all of an entity's pieces so they stay in one plane. */
+            /* Small overhangs (a walk cycle's bob, padding rows) keep the base
+             * on the ground row, or the sprite hops frame to frame. */
+            const int below = entBottom[i] - tag.groundY;
+            const int foot = below > kFootSlack ? entBottom[i] : tag.groundY;
+            const float toCam = (float)(foot - tag.groundY);
+            const float footZ = tag.groundY + scrollY + cy * toCam, footY = elev + 0.5f;
             const float h0 = (float)(foot - sy0), h1 = (float)(foot - sy1);
             /* An entity's pieces turn round its anchor, so they stay together. */
-            const float ax = tag.anchorX + scrollX;
+            const float ax = tag.anchorX + scrollX, baseX = ax + sy * toCam;
             auto at = [&](float a, float h, float* v) {
-                v[0] = ax + rightX * a + upX * h;
+                v[0] = baseX + rightX * a + upX * h;
                 v[1] = footY + upY * h;
                 v[2] = footZ + rightZ * a + upZ * h;
             };
