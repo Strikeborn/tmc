@@ -32,6 +32,7 @@
 #include "port_rom.h"
 #include "port_softslots.h"
 #include "port_roll_attack_macro.h"
+#include "port_voxel.h"
 #include <string.h>
 
 static u32 Port_PcEffectiveBItem(u32 bItem) {
@@ -1935,16 +1936,22 @@ void sub_08078FB0(Entity* this) {
     }
 
     if (animIndex > (u8)gPlayerState.animation) {
-        if (this->animationState >= 5) {
+#ifdef PC_PORT
+        /* 3D view turned: show the side of Link that faces the camera. */
+        const u32 viewState = (this->animationState + Port_Voxel_ViewTurn()) & 7;
+#else
+        const u32 viewState = this->animationState;
+#endif
+        if (viewState >= 5) {
             this->spriteSettings.flipX = 1;
         } else {
             this->spriteSettings.flipX = 0;
         }
 
         if (gPlayerState.flags & PL_MOLDWORM_CAPTURED) {
-            animIndex = gPlayerState.animation + this->animationState;
+            animIndex = gPlayerState.animation + viewState;
         } else {
-            animIndex = (this->animationState >> 1) + gPlayerState.animation;
+            animIndex = (viewState >> 1) + gPlayerState.animation;
         }
     } else {
         animIndex = gPlayerState.animation;

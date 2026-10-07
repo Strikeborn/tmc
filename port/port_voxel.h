@@ -63,6 +63,10 @@ union SDL_Event;
 void Port_Voxel_HandleEvent(const union SDL_Event* e);
 /* Turns the D-pad with the camera so "up" walks away from it. */
 void Port_Voxel_RemapDpad(uint16_t* keyinput);
+/* Camera turn in 45 deg steps (0..7) while walking round a room in the 3D
+ * view, else 0: added to an animationState to pick the sprite facing the
+ * camera. */
+int Port_Voxel_ViewTurn(void);
 
 #ifdef __cplusplus
 }

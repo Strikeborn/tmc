@@ -47,6 +47,9 @@ void Port_Voxel_HandleEvent(const union SDL_Event*) {
 }
 void Port_Voxel_RemapDpad(uint16_t*) {
 }
+int Port_Voxel_ViewTurn(void) {
+    return 0;
+}
 
 #else
 
@@ -1454,6 +1457,28 @@ static bool PresentImpl(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swap, int swa
      * by the pitch. At yaw 0 that is world x and the GBA's own rows. */
     const float rightX = cy, rightZ = -sy;
     const float upX = -sy * std::sin(pitch), upY = std::cos(pitch), upZ = -cy * std::sin(pitch);
+    /* Each entity's lowest art row (its pieces share anchorX/groundY), so
+     * the whole entity lifts together when its art reaches below its feet. */
+    int artBottom[128];
+    for (int i = 0; i < 128; ++i) {
+        artBottom[i] = INT32_MIN;
+        const PortVoxelOamTag& t = gPortVoxelOamTags[i];
+        ObjRect o;
+        if (t.kind == PORT_VOXEL_OAM_ENTITY && DecodeObj(i, obj1d, o))
+            artBottom[i] = (t.parked ? t.trueY : o.y) + o.h;
+    }
+    int entBottom[128];
+    for (int i = 0; i < 128; ++i) {
+        entBottom[i] = artBottom[i];
+        if (artBottom[i] == INT32_MIN)
+            continue;
+        const PortVoxelOamTag& t = gPortVoxelOamTags[i];
+        for (int j = 0; j < 128; ++j) {
+            const PortVoxelOamTag& u = gPortVoxelOamTags[j];
+            if (artBottom[j] != INT32_MIN && u.anchorX == t.anchorX && u.groundY == t.groundY)
+                entBottom[i] = std::max(entBottom[i], artBottom[j]);
+        }
+    }
     /* Lower OAM index wins on GBA; draw high -> low so it lands last (LEQUAL). */
     for (int i = 127; i >= 0; --i) {
         const PortVoxelOamTag tag = gPortVoxelOamTags[i];
@@ -1475,12 +1500,14 @@ static bool PresentImpl(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swap, int swa
             const float d[4][3] = { { x0, y, z0 }, { x1, y, z0 }, { x0, y, z1 }, { x1, y, z1 } };
             std::memcpy(c, d, sizeof(c));
         } else {
-            /* pixel row sy stands (foot - sy) px up the billboard. The foot is
-             * the entity's ground row, pushed down to the sprite's bottom when
-             * the art reaches below it (big bosses anchor at their centre),
-             * so no rows end up buried under the floor. */
-            const int foot = std::max<int>(tag.groundY, sy1);
-            const float footZ = foot + scrollY, footY = elev + 0.5f;
+            /* The billboard stands on the entity's ground row, where its
+             * shadow is. Pixel row sy is (foot - sy) px up it, with foot the
+             * entity's lowest art row when that reaches below the ground (big
+             * bosses anchor at their centre): the whole entity is lifted so
+             * no rows are buried, and its pieces stay in one plane. */
+            const int foot = std::max<int>(tag.groundY, entBottom[i]);
+            const float footZ = tag.groundY + scrollY;
+            const float footY = elev + 0.5f + (float)(foot - tag.groundY) * upY;
             const float h0 = (float)(foot - sy0), h1 = (float)(foot - sy1);
             /* An entity's pieces turn round its anchor, so they stay together. */
             const float ax = tag.anchorX + scrollX;
@@ -1811,12 +1838,18 @@ void Port_Voxel_HandleEvent(const SDL_Event* e) {
     }
 }
 
+int Port_Voxel_ViewTurn(void) {
+    if (!sDrewLastFrame || !SceneApplicable())
+        return 0;
+    return ((int)std::lround(SnappedYaw() / 45.0f) % 8 + 8) % 8;
+}
+
 void Port_Voxel_RemapDpad(uint16_t* keyinput) {
-    /* Only while walking round a room: menus, text-box choices and the 2D
-     * view keep the plain D-pad. */
-    if (!sDrewLastFrame || !SceneApplicable() || (gMessage.state & MESSAGE_ACTIVE))
+    /* Only while walking round a room: menus and text-box choices keep the
+     * plain D-pad. */
+    if (gMessage.state & MESSAGE_ACTIVE)
         return;
-    const int step = ((int)std::lround(SnappedYaw() / 45.0f) % 8 + 8) % 8;
+    const int step = Port_Voxel_ViewTurn();
     if (step == 0)
         return;
     const uint16_t k = *keyinput; /* GBA KEYINPUT: 0 = pressed */
