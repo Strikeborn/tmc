@@ -187,9 +187,7 @@ class Profile:
             self.reach |= np.roll(sa, d, axis=1)
 
 
-def emit(occ: np.ndarray, color, scale: int):
-    """Surface voxels of occ[y, x, z] -> packed (x, y, z, r, g, b) rows."""
-    n = occ.shape[0]
+def interior(occ: np.ndarray) -> np.ndarray:
     inner = occ.copy()
     for ax in range(3):
         for d in (1, -1):
@@ -197,7 +195,13 @@ def emit(occ: np.ndarray, color, scale: int):
     inner[[0, -1], :, :] = False
     inner[:, [0, -1], :] = False
     inner[:, :, [0, -1]] = False
-    ys, xs, zs = np.nonzero(occ & ~inner)
+    return inner
+
+
+def emit(occ: np.ndarray, color, scale: int, solid: bool = False):
+    """Voxels of occ[y, x, z] (surface only unless solid) -> packed
+    (x, y, z, r, g, b) rows."""
+    ys, xs, zs = np.nonzero(occ if solid else occ & ~interior(occ))
     rgb = color(ys, xs, zs)
     out = np.empty((len(ys), 6), np.int16)
     out[:, 0] = xs - FOOT_X * scale
@@ -219,8 +223,9 @@ def neighbourhood_normals(occ: np.ndarray, ys, xs, zs, r: int):
     return nx, nz
 
 
-def carve_base(front, back, side, scale: int, prof: Profile):
-    """Standing pose from all three pictures, around the profile's straight axis."""
+def carve_base(front, back, side, scale: int, prof: Profile, solid: bool = False):
+    """Standing pose from all three pictures, around the profile's straight axis.
+    solid: every voxel (for rigging), not only the surface."""
     n = SIZE * scale
     back = back[:, ::-1]
     F, B, S = up(front, scale), up(back, scale), up(side, scale)
@@ -236,16 +241,58 @@ def carve_base(front, back, side, scale: int, prof: Profile):
     keep = trimmed.sum(axis=2) >= scale  # never trim a column away (thin hair tips)
     occ = np.where(keep[..., None], trimmed, occ)
 
+    # Ears: skin at the head's sides, outside the hair. The side picture puts
+    # hair there, so they keep the front picture's colour.
+    fpart = parts_of(front)
+    neck = neck_row(front)
+    ear = np.zeros((SIZE, SIZE), bool)
+    for y in range(neck):
+        xs_ = np.nonzero(front[y, :, 3] > 0)[0]
+        if len(xs_):
+            for x in (xs_.min(), xs_.min() + 1, xs_.max() - 1, xs_.max()):
+                ear[y, x] |= fpart[y, x] == SKIN
+    ear = up(ear, scale)
+
     def color(ys, xs, zs):
         nx, nz = neighbourhood_normals(occ, ys, xs, zs, scale)
-        flank = (np.abs(nx) > np.abs(nz) + 1) & sa[ys, zs]
+        flank = (np.abs(nx) > np.abs(nz) + 1) & sa[ys, zs] & ~ear[ys, xs]
         front_side = zs >= prof.zc
         c = np.where(front_side[:, None],
                      np.where(fa[ys, xs][:, None], F[ys, xs, :3], B[ys, xs, :3]),
                      np.where(ba[ys, xs][:, None], B[ys, xs, :3], F[ys, xs, :3]))
         return np.where(flank[:, None], S[ys, zs, :3], c)
 
-    return emit(occ, color, scale)
+    return emit(occ, color, scale, solid)
+
+
+def surface(vox: np.ndarray, scale: int, gap: int) -> np.ndarray:
+    """Solid voxels after rigging -> their surface, with vertical gaps of up to
+    gap voxels closed (a bobbing head or shifted body leaves a seam), each
+    filled voxel taking the colour of the one above it."""
+    n = SIZE * scale
+    X = vox[:, 0].astype(np.int64) + FOOT_X * scale
+    Y = FOOT_Y * scale - vox[:, 1].astype(np.int64)
+    Z = vox[:, 2].astype(np.int64) + FOOT_X * scale
+    ok = (X >= 0) & (X < n) & (Y >= 0) & (Y < n) & (Z >= 0) & (Z < n)
+    idx = np.full((n, n, n), -1, np.int32)
+    idx[Y[ok], X[ok], Z[ok]] = np.nonzero(ok)[0]
+    above = np.full_like(idx, -1)
+    below = np.full_like(idx, -1)
+    da = np.zeros(idx.shape, np.int16)
+    db = np.zeros(idx.shape, np.int16)
+    for d in range(1, gap + 1):
+        a = np.roll(idx, d, axis=0)   # the voxel d rows up
+        a[:d] = -1
+        b = np.roll(idx, -d, axis=0)  # d rows down
+        b[-d:] = -1
+        na, nb = (above < 0) & (a >= 0), (below < 0) & (b >= 0)
+        above, da = np.where(na, a, above), np.where(na, d, da)
+        below, db = np.where(nb, b, below), np.where(nb, d, db)
+    fill = (idx < 0) & (above >= 0) & (below >= 0)
+    idx = np.where(fill, np.where(da <= db, above, below), idx)  # each half from its own side
+    occ = idx >= 0
+    rgb = vox[:, 3:]
+    return emit(occ, lambda ys, xs, zs: rgb[idx[ys, xs, zs]], scale)
 
 
 HAND_ROW = FOOT_Y - 10  # sprite row of the sword hand when standing
@@ -441,6 +488,9 @@ def rig_frame(base_vox, labels, scale: int, base_front: dict, base_side: dict, f
     sx = np.clip((v[:, 0] + FOOT_X * scale) // scale, 0, SIZE - 1)
     sy = np.clip((FOOT_Y * scale - v[:, 1]) // scale, 0, SIZE - 1)
     lab = labels[sy, sx]
+    # what sticks out past the front outline (nose, Ezlo's tail) goes with its row
+    neck = int(np.nonzero((labels == BODY).any(axis=1))[0].min()) if (labels == BODY).any() else SIZE
+    lab = np.where(lab == 0, np.where(sy < neck, HEAD, BODY), lab)
 
     def move(part, dx, dy, dz):
         sel = lab == part
@@ -450,8 +500,9 @@ def rig_frame(base_vox, labels, scale: int, base_front: dict, base_side: dict, f
 
     bob = front["top"] - base_front["top"]
     hx = (front["head"][0] - base_front["head"][0]) if front["head"] and base_front["head"] else 0
+    hx = hx if abs(hx) >= 1 else 0  # sub-pixel centroid noise
     move(HEAD, hx, bob, 0)
-    move(BODY, 0, front["neck"] - base_front["neck"], 0)
+    move(BODY, 0, bob, 0)  # the torso bobs with the head; the feet are placed on their own
     # feet: sideways and lift from the front picture; forward/back from the
     # side picture, pairing the higher (lifted) boot in both
     fz = [0.0, 0.0]
@@ -545,6 +596,7 @@ def main() -> int:
         name = SPRITE_NAMES[sprite]
         base_vox = carve_base(idle[DOWN], idle[UP], idle[RIGHT], scale, prof)
         models[f"{name}: standing"] = [base_vox]
+        solid_vox = carve_base(idle[DOWN], idle[UP], idle[RIGHT], scale, prof, solid=True)
         # rigged: the one standing model, parts moved per frame (front frame for
         # sideways/up-down, side frame for forward/back); one model, every facing
         labels = rig_labels(idle[DOWN])
@@ -554,8 +606,9 @@ def main() -> int:
             seq = []
             for st in steps:
                 sideimg = pics.get((sprite, anim + RIGHT, st))
-                v = rig_frame(base_vox, labels, scale, bf, bs, measure(pics[(sprite, anim + DOWN, st)], False),
+                v = rig_frame(solid_vox, labels, scale, bf, bs, measure(pics[(sprite, anim + DOWN, st)], False),
                               measure(sideimg, True) if sideimg is not None else None)
+                v = surface(v, scale, gap=3 * scale)
                 if pose == "sword":  # the blade as the front swing drew it
                     v = np.vstack([v, blade_voxels(pics[(sprite, anim + DOWN, st)], DOWN, scale, prof)])
                 seq.append(v)
