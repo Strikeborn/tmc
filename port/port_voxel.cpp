@@ -88,6 +88,7 @@ extern "C" {
 #include "port_widescreen.h"
 extern u16 gMapDataBottomSpecial[0x4000];
 extern u16 gMapDataTopSpecial[0x4000];
+bool32 IsTileCollision(const u8* collisionData, s32 x, s32 y, u32 collisionType);
 }
 
 static const unsigned char kVoxelVertSpv[] = {
@@ -314,7 +315,7 @@ Vert sVerts[kMaxVerts];
 /* Room geometry: up to ~4 quads per tile (floor/underlay, top, wall, sides)
  * plus the 24-tile edge margin around a 64x64 room. */
 /* tiles and margin, plus room for voxel props (a bush is ~800 faces) */
-constexpr int kMaxMapVerts = (64 * 64 * 8 + 112 * 112 * 2) * 6 + 3000000; /* ~128 MB with props and trees */
+constexpr int kMaxMapVerts = (64 * 64 * 8 + 112 * 112 * 2) * 6 + 6000000; /* ~230 MB: a dense wood of voxel trees takes ~3.7M */
 Vert sMapVerts[kMaxMapVerts];
 int sMapVertCount = 0;
 Uint64 sMapKey = 0;
@@ -743,6 +744,21 @@ int HalfX(int x, int y) {
     }
 }
 
+/* The tile's walk-blocking pixels exactly as the game tests them (quarter
+ * masks, diagonals, rounded corners): 16 rows, bit x set where solid. */
+void TileCollisionRows(int x, int y, Uint16 rows[16]) {
+    const u8 v = gMapBottom.collisionData[y * 64 + x];
+    for (int r = 0; r < 16; ++r)
+        rows[r] = v == 0x0F ? 0xFFFF : 0;
+    if (v == 0 || v == 0x0F)
+        return;
+    const s32 ox = gRoomControls.origin_x + x * 16, oy = gRoomControls.origin_y + y * 16;
+    for (int r = 0; r < 16; ++r)
+        for (int c = 0; c < 16; ++c)
+            if (IsTileCollision(gMapBottom.collisionData, ox + c, oy + r, 0))
+                rows[r] |= (Uint16)(1u << c);
+}
+
 /* Sunk surfaces: water sits a little below the ground so shorelines show a
  * lip; holes drop further. Shallows stay level (Link wades, not swims). */
 float SinkDepth(int x, int y) {
@@ -1053,12 +1069,12 @@ void BuildMap(void) {
     /* The room's commonest walkable ground tile: underlay where no walkable
      * neighbour exists (the middle of a forest). */
     int groundX = -1, groundY = -1;
-    {
+    for (int maxCover = 0; maxCover < 2 && groundX < 0; ++maxCover) { /* uncovered ground if any */
         std::map<int, int> freq;
         int bestN = 0;
         for (int y = 0; y < H; ++y)
             for (int x = 0; x < W; ++x)
-                if (!Geom(x, y) && Cover(x, y) == 0 && SinkDepth(x, y) == 0.0f) {
+                if (!Geom(x, y) && Cover(x, y) <= maxCover && SinkDepth(x, y) == 0.0f) {
                     const int k = gMapBottom.mapData[y * 64 + x];
                     if (++freq[k] > bestN)
                         bestN = freq[k], groundX = x, groundY = y;
@@ -1076,6 +1092,15 @@ void BuildMap(void) {
                     return true;
                 }
             }
+        /* a room whose ground is all under see-through overhead art (a
+         * misty wood): its partly covered neighbours */
+        for (const auto& d : kNb) {
+            const int nx = x + d[0], ny = y + d[1];
+            if (inRoom(nx, ny) && !Geom(nx, ny) && Cover(nx, ny) < 2 && SinkDepth(nx, ny) == 0.0f) {
+                ux = nx, uy = ny;
+                return true;
+            }
+        }
         ux = groundX, uy = groundY;
         return groundX >= 0;
     };
@@ -1803,19 +1828,49 @@ void BuildMap(void) {
          * so they are the crown's height, not its depth): a round body as
          * wide as the leaves, its front at the footprint's front, raised on
          * the trunk so Link fits under its back edge. */
-        const float trunkZ = (trow >= 0 ? trow : tr.y1) * 16.0f + 8.0f;
-        int cz0 = 64, cz1 = -1;
-        for (int ty = tr.y0; ty <= tr.y1; ++ty)
-            for (int tx = tr.x0; tx <= tr.x1; ++tx)
-                if (treeOf[ty * 64 + tx] == id && geom[ty * 64 + tx] == 1)
-                    cz0 = std::min(cz0, ty), cz1 = std::max(cz1, ty);
-        if (cz1 < 0)
-            cz0 = cz1 = trow >= 0 ? trow : tr.y1;
+        /* the footprint: the tree's tiles' collision pixels (rounded edges
+         * and all), in room pixels */
+        static Uint16 footRows[16 * 16][16]; /* per tile of the tree's box, max 16x16 tiles */
+        const int ftw = std::min(tr.x1 - tr.x0 + 1, 16), fth = std::min(tr.y1 - tr.y0 + 1, 16);
+        int fx0 = X1, fx1 = X0 - 1, fz0 = Y1, fz1 = Y0 - 1;
+        float fsx = 0.0f, fsz = 0.0f;
+        int fn = 0;
+        for (int ty = 0; ty < fth; ++ty)
+            for (int tx = 0; tx < ftw; ++tx) {
+                Uint16* rows = footRows[ty * 16 + tx];
+                const int gx = tr.x0 + tx, gy = tr.y0 + ty;
+                if (treeOf[gy * 64 + gx] != id) {
+                    std::memset(rows, 0, 32);
+                    continue;
+                }
+                TileCollisionRows(gx, gy, rows);
+                for (int r = 0; r < 16; ++r)
+                    for (int c = 0; c < 16; ++c)
+                        if (rows[r] >> c & 1) {
+                            const int sx = gx * 16 + c, sz = gy * 16 + r;
+                            fx0 = std::min(fx0, sx), fx1 = std::max(fx1, sx), fz0 = std::min(fz0, sz),
+                            fz1 = std::max(fz1, sz);
+                            fsx += sx, fsz += sz, ++fn;
+                        }
+            }
+        auto footAt = [&](int sx, int sz) {
+            const int tx = (sx >> 4) - tr.x0, ty = (sz >> 4) - tr.y0;
+            return sx >= 0 && sz >= 0 && tx >= 0 && ty >= 0 && tx < ftw && ty < fth &&
+                   (footRows[ty * 16 + tx][sz & 15] >> (sx & 15) & 1);
+        };
+        if (fn == 0) { /* no collision of its own (a trunk hidden behind others): its trunk tiles */
+            const int r = trow >= 0 ? trow : tr.y1;
+            fx0 = (tx0 <= tx1 ? tx0 : tr.x0) * 16, fx1 = (tx0 <= tx1 ? tx1 + 1 : tr.x1 + 1) * 16 - 1;
+            fz0 = r * 16, fz1 = r * 16 + 15;
+        }
+        const float fcx = fn ? fsx / fn + 0.5f : (fx0 + fx1 + 1) * 0.5f,
+                    fcz = fn ? fsz / fn + 0.5f : (fz0 + fz1 + 1) * 0.5f;
+        const int artTop = (trow >= 0 ? trow : fz1 >> 4) * 16; /* the trunk's art row */
         const float xc = (lx0 + lx1 + 1) * 0.5f, rx = (lx1 - lx0 + 1) * 0.5f;
         const float mid = (ltop + lbot + 1) * 0.5f;
-        const float rz = std::clamp(std::max((cz1 - cz0 + 1) * 8.0f, rx * 0.85f), 8.0f, 40.0f);
+        const float rz = std::clamp(std::max((fz1 - fz0 + 1) * 0.5f, rx * 0.85f), 8.0f, 40.0f);
         const float rh = std::clamp(rx * 0.8f, 10.0f, 40.0f);
-        const float zc = (cz1 + 1) * 16.0f - rz, h0 = std::clamp(rx * 0.6f, 12.0f, 24.0f), hc = h0 + rh;
+        const float zc = fz1 + 1.0f - rz, h0 = std::clamp(rx * 0.6f, 12.0f, 24.0f), hc = h0 + rh;
         /* the crown's rows in the GBA's view (z - h), which the leaves' rows
          * are stretched over for its colours */
         const float pspan = std::sqrt(rz * rz + rh * rh), ptop = zc - hc - pspan, pbot = zc - hc + pspan;
@@ -1835,6 +1890,7 @@ void BuildMap(void) {
         auto at = [&](int i, int j, int k) {
             return i >= 0 && i < nx && j >= 0 && j < nh && k >= 0 && k < nz && occ[i][j][k];
         };
+        bool trunkPass = false;
         /* face colour: the art pixel the voxel lands on in the GBA's view */
         auto face = [&](const float (&q)[4][3], float px, float ph, float pz) {
             int sx2 = (int)px;
@@ -1843,11 +1899,13 @@ void BuildMap(void) {
              * faces toward the art's shaded bottom rows); trunk: the art the
              * GBA's view puts there */
             int sy = (int)(pz - ph);
-            if (ph > h0 - 1.0f)
+            if (trunkPass)
+                sy = std::max(sy, artTop); /* roots and bark: the trunk row's art, rising up it */
+            else if (ph > h0 - 1.0f)
                 sy = (int)(ltop + (pz - ph - ptop) / (pbot - ptop) * (lbot - ltop));
             /* crown voxels landing just off the leaves take the leaf pixel
              * nearest them toward the crown's middle */
-            if (ph > h0 - 1.0f && !leaf(sx, sy)) {
+            if (!trunkPass && ph > h0 - 1.0f && !leaf(sx, sy)) {
                 const float dx = xc - sx, dy = mid - sy, len = std::max(1.0f, std::sqrt(dx * dx + dy * dy));
                 for (float d = 1.0f; d < len; d += 1.0f) {
                     const int qx = (int)(sx + dx * d / len), qy = (int)(sy + dy * d / len);
@@ -1900,14 +1958,42 @@ void BuildMap(void) {
                             !at(i, j, k + 1), !at(i, j, k - 1), !at(i - 1, j, k), !at(i + 1, j, k), x0 + V * 0.5f,
                             h0b + V * 0.5f, z0 + V * 0.5f);
                 }
-        /* trunk: a post from the ground into the crown, as wide as a third of
-         * the trunk tiles, wearing the trunk art it lands on */
-        if (trow >= 0) {
-            const float tw = std::clamp((tx1 - tx0 + 1) * 16.0f / 3.0f, 6.0f, 20.0f);
-            const float cx = (tx0 + tx1 + 1) * 8.0f;
-            for (float h = 0.0f; h < h0 + 4.0f; h += V)
-                emitBox(cx - tw / 2, cx + tw / 2, h, h + V, trunkZ - tw / 2, trunkZ + tw / 2, false, false, true, true,
-                        true, true, cx, h + 1.0f, trunkZ);
+        /* trunk: roots spread over the whole collision footprint at the
+         * ground, drawing in to a trunk a few voxels up, which rises into
+         * the crown. A voxel at height h is in when its point pulled out from
+         * the footprint's centre by 1/f(h) lands on a solid pixel. */
+        {
+            trunkPass = true;
+            const float half = std::max(fx1 - fx0 + 1, fz1 - fz0 + 1) * 0.5f;
+            const float k = std::clamp(std::max(5.0f, half * 0.3f) / half, 0.1f, 1.0f), hr = 10.0f;
+            const int bx0 = fx0 & ~1, bz0 = fz0 & ~1;
+            const int mx = std::min((fx1 - bx0) / V + 1, 40), mz = std::min((fz1 - bz0) / V + 1, 40),
+                      mh = std::min((int)((h0 + 6.0f) / V), 40);
+            static Uint8 tocc[40][40][40]; /* [x][h][z] */
+            for (int i = 0; i < mx; ++i)
+                for (int j = 0; j < mh; ++j)
+                    for (int kk = 0; kk < mz; ++kk) {
+                        const float px = bx0 + (i + 0.5f) * V, ph = (j + 0.5f) * V, pz = bz0 + (kk + 0.5f) * V;
+                        const float f = 1.0f - (1.0f - k) * std::min(1.0f, ph / hr);
+                        const int qx = (int)std::floor(fcx + (px - fcx) / f), qz = (int)std::floor(fcz + (pz - fcz) / f);
+                        tocc[i][j][kk] = fn ? footAt(qx, qz)
+                                            : (std::fabs(px - fcx) <= (fx1 - fx0 + 1) * 0.5f * f &&
+                                               std::fabs(pz - fcz) <= (fz1 - fz0 + 1) * 0.5f * f);
+                    }
+            auto tat = [&](int i, int j, int kk) {
+                return i >= 0 && i < mx && j >= 0 && j < mh && kk >= 0 && kk < mz && tocc[i][j][kk];
+            };
+            for (int i = 0; i < mx; ++i)
+                for (int j = 0; j < mh; ++j)
+                    for (int kk = 0; kk < mz; ++kk) {
+                        if (!tocc[i][j][kk])
+                            continue;
+                        const float x0 = bx0 + i * V, hb = j * V, z0 = bz0 + kk * V;
+                        emitBox(x0, x0 + V, hb, hb + V, z0, z0 + V, !tat(i, j + 1, kk), false, !tat(i, j, kk + 1),
+                                !tat(i, j, kk - 1), !tat(i - 1, j, kk), !tat(i + 1, j, kk), x0 + V * 0.5f,
+                                hb + V * 0.5f, z0 + V * 0.5f);
+                    }
+            trunkPass = false;
         }
     };
 
