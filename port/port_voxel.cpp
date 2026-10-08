@@ -2952,7 +2952,10 @@ void BuildMap(void) {
     for (int y = H - 1; y >= 0 && dirtX < 0; --y)
         for (int x = 0; x < W; ++x)
             if (gMapBottom.actTiles[y * 64 + x] == 0x2a && kind[y * 64 + x] == 2 &&
-                (y + 1 >= H || gMapBottom.actTiles[(y + 1) * 64 + x] != 0x2a)) {
+                (y + 1 >= H || gMapBottom.actTiles[(y + 1) * 64 + x] != 0x2a) && x > 0 && x + 1 < W &&
+                gMapBottom.actTiles[y * 64 + x - 1] == 0x2a && gMapBottom.actTiles[y * 64 + x + 1] == 0x2a &&
+                BottomTileType(y * 64 + x) == BottomTileType(y * 64 + x - 1) &&
+                BottomTileType(y * 64 + x) == BottomTileType(y * 64 + x + 1)) { /* mid-face, not a corner */
                 dirtX = x, dirtY = y;
                 break;
             }
@@ -3166,6 +3169,12 @@ void BuildMap(void) {
         constexpr int NH2 = 32;
         static Uint8 occ2[64][NH2][64];
         std::memset(occ2, 0, sizeof(occ2));
+        /* per column: the shrub's art rows (top half: it seen from above;
+         * bottom half: its front) and its footprint's depth and height */
+        struct ShrubMap {
+            float r0, ph, zf0, D, Hh;
+        };
+        static ShrubMap colMap[64][64];
         /* each outlined shrub (a connected patch of body pixels) its own dome */
         static Sint16 comp[64][64];
         for (int r = 0; r < PH; ++r)
@@ -3209,6 +3218,7 @@ void BuildMap(void) {
                         const float e = ex * ex + ez * ez;
                         if (e >= 1.0f)
                             continue;
+                        colMap[vx][vz] = { (float)r0, (float)ph, dcz - rz, 2.0f * rz, Hh };
                         const float hTop = Hh * std::sqrt(1.0f - e);
                         for (int vh = 0; vh < std::min(NH2, (int)std::lround(hTop)); ++vh)
                             occ2[vx][vh][vz] = 1;
@@ -3251,17 +3261,25 @@ void BuildMap(void) {
                 for (int vh = 0; vh < NH2; ++vh) {
                     if (!occ2[vx][vh][vz])
                         continue;
-                    {
+                    const ShrubMap& m = colMap[vx][vz];
+                    auto artAt = [&](float row) {
                         int tc, tr;
-                        nearest(vx, std::max(0, vz - vh), false, tc, tr);
+                        nearest(vx, std::clamp((int)row, 0, PH - 1), false, tc, tr);
                         if (tc < 0)
                             tc = vx, tr = vz;
                         ut = sh.x0 * 16.0f + tc + 0.5f, vt = sh.y0 * 16.0f + tr + 0.5f;
-                    }
+                    };
+                    const float half = m.ph * 0.5f;
+                    /* sides: the front half of the art, higher voxels its upper rows */
+                    artAt(m.r0 + half + std::clamp(1.0f - (vh + 0.5f) / m.Hh, 0.0f, 1.0f) * (half - 1.0f));
                     const float bot = (float)vh, top = bot + 1;
                     if (!filled(vx, vh + 1, vz)) {
+                        /* the top: the upper half of the art, laid over the footprint */
+                        const float u0 = ut, v0 = vt;
+                        artAt(m.r0 + std::clamp((vz + 0.5f - m.zf0) / m.D, 0.0f, 1.0f) * (half - 1.0f));
                         const float q[4][3] = { { px0, top, pz0 }, { px1, top, pz0 }, { px0, top, pz1 }, { px1, top, pz1 } };
                         face(q, true);
+                        ut = u0, vt = v0;
                     }
                     if (!filled(vx, vh, vz + 1)) {
                         const float q[4][3] = { { px0, top, pz1 }, { px1, top, pz1 }, { px0, bot, pz1 }, { px1, bot, pz1 } };
@@ -3913,23 +3931,28 @@ static bool PresentImpl(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swap, int swa
              * sinking into it or lifting the entity. Entities whose art hangs
              * far below their ground row (bosses anchored at their centre)
              * stand on their lowest row instead, moved toward the camera. */
+            /* a door stands still, facing south as the GBA shows it */
+            const bool still = tag.fixed != 0;
+            const float trX = still ? 1.0f : rightX, trZ = still ? 0.0f : rightZ;
+            const float tuX = still ? 0.0f : upX, tuY = still ? 1.0f : upY, tuZ = still ? 0.0f : upZ;
+            const float tsy = still ? 0.0f : sy, tcy = still ? 1.0f : cy;
             const int below = entBottom[i] - tag.groundY;
             const int foot = below > kBossSlack ? entBottom[i] : tag.groundY;
             const float toCam = (float)(foot - tag.groundY);
-            const float footZ = tag.groundY + scrollY + groundShift + cy * toCam, footY = elev + 0.5f;
+            const float footZ = tag.groundY + scrollY + groundShift + tcy * toCam, footY = elev + 0.5f;
             /* An entity's pieces turn round its anchor, so they stay together. */
-            const float ax = tag.anchorX + scrollX, baseX = ax + sy * toCam;
+            const float ax = tag.anchorX + scrollX, baseX = ax + tsy * toCam;
             auto stand = [&](float a, int row, float* v) {
                 const float h = (float)(foot - row);
-                v[0] = baseX + rightX * a + upX * h;
-                v[1] = footY + upY * h;
-                v[2] = footZ + rightZ * a + upZ * h;
+                v[0] = baseX + trX * a + tuX * h;
+                v[1] = footY + tuY * h;
+                v[2] = footZ + trZ * a + tuZ * h;
             };
             auto lie = [&](float a, int row, float* v) { /* row >= foot */
                 const float t = (float)(row - foot);
-                v[0] = baseX + rightX * a + sy * t;
+                v[0] = baseX + trX * a + tsy * t;
                 v[1] = footY;
-                v[2] = footZ + rightZ * a + cy * t;
+                v[2] = footZ + trZ * a + tcy * t;
             };
             const float a0 = x0 - ax, a1 = x1 - ax;
             const int fold = std::clamp(foot, sy0, sy1);

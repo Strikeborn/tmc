@@ -17,6 +17,7 @@
 #include "color.h"
 #include "entity.h"
 #include "global.h"
+#include "object.h"
 #include "main.h"
 #include "room.h"
 #include "screen.h"
@@ -937,6 +938,11 @@ static void ProcessEntityForDraw(Entity* entity) {
         extern PlayerEntity gPlayerEntity;
         sVoxelCtx.player = entity == &gPlayerEntity.base;
     }
+    /* doors are part of the building: in 3D they stay facing south */
+    sVoxelCtx.fixed = entity->kind == OBJECT &&
+                      (entity->id == HOUSE_DOOR_EXT || entity->id == HOUSE_DOOR_INT || entity->id == LOCKED_DOOR ||
+                       entity->id == LIGHT_DOOR || entity->id == BOSS_DOOR || entity->id == METAL_DOOR ||
+                       entity->id == MINECART_DOOR);
 
     /* Check shadow flag (bit 3 of spritePriority byte, offset 0x29) */
     s8 prioRaw = *(s8*)&entity->spritePriority;
