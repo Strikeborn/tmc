@@ -2248,6 +2248,10 @@ void BuildMap(void) {
         auto leafyTile = [&](int x, int y) {
             if (!inRoom(x, y) || geom[y * 64 + x] != 1 || treeOf[y * 64 + x] || Cover(x, y) || CliffTile(x, y))
                 return false;
+            /* a bush outlined within its own tile is its own bush (a patch
+             * of liftable bushes), not part of a bigger shrub (scratch slot) */
+            if (BuildPropMask(x, y, kMaxProps, bChar, b8 != 0))
+                return false;
             int g = 0, all = 0;
             for (int i = 0; i < 256; i += 2) {
                 const int c = BottomPixel(x, y, i & 15, i >> 4, bChar, b8 != 0);
@@ -2927,11 +2931,14 @@ void BuildMap(void) {
     };
 
     /* ---- pass 2: draw ----
-     * Everything is built at ground 0 and lifted to its terrain height. */
+     * Everything is built at ground 0 and lifted to its terrain height. The
+     * GBA draws raised ground shifted up the screen by its height (a screen
+     * row is z - h), so what stands h up stands h further south too: the
+     * top of a plateau meets the top of its cliff wall. */
     auto liftFrom = [&](int n0, float dh) {
         if (dh != 0.0f)
             for (int i = n0; i < n; ++i)
-                sMapVerts[i].pos[1] += dh;
+                sMapVerts[i].pos[1] += dh, sMapVerts[i].pos[2] += dh;
     };
     for (int y = 0; y < H; ++y)
         for (int x = 0; x < W; ++x) {
@@ -2949,18 +2956,18 @@ void BuildMap(void) {
                 for (int k = 0; k < 4; ++k) {
                     const float hk = h0 + (h1 - h0) * (k + 1) / 4.0f, hkPrev = h0 + (h1 - h0) * k / 4.0f;
                     if (stairV) { /* climbing north: step k from the south edge */
-                        const float z1 = y * 16.0f + 16 - k * 4.0f, z0 = z1 - 4.0f;
+                        const float z1 = y * 16.0f + 16 - k * 4.0f + hk, z0 = z1 - 4.0f;
                         flatL(false, x, x, y, hk, z0, z1, 0);
                         const float c[4][3] = { { x * 16.0f, hk, z1 }, { x * 16.0f + 16, hk, z1 },
                                                 { x * 16.0f, hkPrev, z1 }, { x * 16.0f + 16, hkPrev, z1 } };
                         Quad(sMapVerts, kMaxMapVerts, n, c, x * 16.0f, z0, x * 16.0f + 16, z1, 0, 0u, bChar, b8);
                     } else { /* climbing east: step k from the west edge */
                         const float x0 = x * 16.0f + k * 4.0f, x1 = x0 + 4.0f;
-                        const float c[4][3] = { { x0, hk, y * 16.0f }, { x1, hk, y * 16.0f },
-                                                { x0, hk, y * 16.0f + 16 }, { x1, hk, y * 16.0f + 16 } };
+                        const float zs = y * 16.0f + hk;
+                        const float c[4][3] = { { x0, hk, zs }, { x1, hk, zs }, { x0, hk, zs + 16 }, { x1, hk, zs + 16 } };
                         Quad(sMapVerts, kMaxMapVerts, n, c, x0, y * 16.0f, x1, y * 16.0f + 16, 0, 0u, bChar, b8);
-                        const float r[4][3] = { { x0, hk, y * 16.0f + 16 }, { x0, hk, y * 16.0f },
-                                                { x0, hkPrev, y * 16.0f + 16 }, { x0, hkPrev, y * 16.0f } };
+                        const float r[4][3] = { { x0, hk, zs + 16 }, { x0, hk, zs },
+                                                { x0, hkPrev, zs + 16 }, { x0, hkPrev, zs } };
                         Quad(sMapVerts, kMaxMapVerts, n, r, x0, y * 16.0f, x0 + 1, y * 16.0f + 16, 0, 0u, bChar, b8);
                     }
                 }
@@ -3021,7 +3028,7 @@ void BuildMap(void) {
                 if (hi - lo < 1.0f)
                     continue;
                 float c[4][3];
-                const float x0 = x * 16.0f, x1 = x0 + 16, z0 = y * 16.0f, z1 = z0 + 16;
+                const float x0 = x * 16.0f, x1 = x0 + 16, z0 = y * 16.0f + hi, z1 = z0 + 16;
                 if (e == 0) { const float q[4][3] = { { x0, hi, z1 }, { x1, hi, z1 }, { x0, lo, z1 }, { x1, lo, z1 } }; std::memcpy(c, q, sizeof c); }
                 else if (e == 1) { const float q[4][3] = { { x1, hi, z0 }, { x0, hi, z0 }, { x1, lo, z0 }, { x0, lo, z0 } }; std::memcpy(c, q, sizeof c); }
                 else if (e == 2) { const float q[4][3] = { { x1, hi, z1 }, { x1, hi, z0 }, { x1, lo, z1 }, { x1, lo, z0 } }; std::memcpy(c, q, sizeof c); }
@@ -3272,7 +3279,8 @@ void BuildMap(void) {
                 while (uy >= 0 && Geom(x, uy))
                     --uy;
                 if (uy >= 0 && Cover(x, uy) < 2 && SinkDepth(x, uy) == 0.0f) {
-                    flatL(false, x, x, uy, terr[uy * 64 + x] - base, r * 16.0f, r * 16.0f + 16, 0);
+                    const float dn = terr[uy * 64 + x] - base;
+                    flatL(false, x, x, uy, dn, r * 16.0f + dn, r * 16.0f + 16 + dn, 0);
                     continue;
                 }
             }
@@ -3358,9 +3366,10 @@ void BuildMap(void) {
                 continue;
             const int ex = std::clamp(x, 0, W - 1), ey = std::clamp(y, 0, H - 1);
             const float h = hAt(ex, ey); /* meet the edge cell exactly: no open step */
-            flatL(false, x, ex, ey, h, y * 16.0f, y * 16.0f + 16, 0);
+            const float zs = terr[ey * 64 + ex]; /* shifted south like the edge cell's ground */
+            flatL(false, x, ex, ey, h, y * 16.0f + zs, y * 16.0f + 16 + zs, 0);
             if (Cover(ex, ey))
-                flatL(true, x, ex, ey, h + 0.3f, y * 16.0f, y * 16.0f + 16, 0);
+                flatL(true, x, ex, ey, h + 0.3f, y * 16.0f + zs, y * 16.0f + 16 + zs, 0);
             /* Step to the next margin cell east: close it with a face wearing
              * the higher cell's art (see-through texels in its material). */
             const int nx = x + 1;
@@ -3379,8 +3388,8 @@ void BuildMap(void) {
                         if (ci >= 0 && !Dark555(gBgPltt[ci]) && ++cnts[ci] > domN)
                             domN = cnts[ci], dom = ci;
                     }
-                    const float c[4][3] = { { xs, hi, y * 16.0f }, { xs, hi, y * 16.0f + 16 }, { xs, lo, y * 16.0f },
-                                            { xs, lo, y * 16.0f + 16 } };
+                    const float c[4][3] = { { xs, hi, y * 16.0f + zs }, { xs, hi, y * 16.0f + 16 + zs },
+                                            { xs, lo, y * 16.0f + zs }, { xs, lo, y * 16.0f + 16 + zs } };
                     Quad(sMapVerts, kMaxMapVerts, n, c, sx * 16.0f, ey * 16.0f, sx * 16.0f + 16, ey * 16.0f + 16, 0,
                          topArt ? 128u : 0u, topArt ? tChar : bChar, (topArt ? t8 : b8) | 2u | ((Uint32)dom << 20));
                 }
@@ -3585,7 +3594,7 @@ static void GatherFadeActors(PortVoxelFade& f) {
         { /* standing on raised ground */
             const int tx = (int)f.actors[n][0] >> 4, ty = (int)f.actors[n][2] >> 4;
             if (tx >= 0 && ty >= 0 && tx < sTerrainW && ty < sTerrainHt)
-                f.actors[n][1] += sTerrainH[ty * 64 + tx];
+                f.actors[n][1] += sTerrainH[ty * 64 + tx], f.actors[n][2] += sTerrainH[ty * 64 + tx];
         }
         f.actors[n][3] = 0.0f;
         ++n;
@@ -3748,16 +3757,17 @@ static bool PresentImpl(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swap, int swa
         }
         const float x0 = o.x + scrollX, x1 = x0 + o.w;
         const int sy0 = o.y, sy1 = sy0 + o.h;
-        float elev = tag.layer == 2 ? kTopLayerLift : 0.0f;
-        { /* the terrain under the entity's feet */
+        float elev = tag.layer == 2 ? kTopLayerLift : 0.0f, groundShift = 0.0f;
+        { /* the terrain under the entity's feet: up, and south like the ground */
             const int tx = (int)std::floor((tag.anchorX + scrollX) / 16.0f),
                       ty = (int)std::floor((tag.groundY + scrollY - 1.0f) / 16.0f);
             if (tx >= 0 && ty >= 0 && tx < sTerrainW && ty < sTerrainHt)
-                elev += sTerrainH[ty * 64 + tx];
+                groundShift = sTerrainH[ty * 64 + tx];
+            elev += groundShift;
         }
         float c[4][3];
         if (tag.kind == PORT_VOXEL_OAM_DECAL) {
-            const float y = elev + 0.25f, z0 = sy0 + scrollY, z1 = sy1 + scrollY;
+            const float y = elev + 0.25f, z0 = sy0 + scrollY + groundShift, z1 = sy1 + scrollY + groundShift;
             const float d[4][3] = { { x0, y, z0 }, { x1, y, z0 }, { x0, y, z1 }, { x1, y, z1 } };
             std::memcpy(c, d, sizeof(c));
         } else {
@@ -3772,7 +3782,7 @@ static bool PresentImpl(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swap, int swa
             const int below = entBottom[i] - tag.groundY;
             const int foot = below > kBossSlack ? entBottom[i] : tag.groundY;
             const float toCam = (float)(foot - tag.groundY);
-            const float footZ = tag.groundY + scrollY + cy * toCam, footY = elev + 0.5f;
+            const float footZ = tag.groundY + scrollY + groundShift + cy * toCam, footY = elev + 0.5f;
             /* An entity's pieces turn round its anchor, so they stay together. */
             const float ax = tag.anchorX + scrollX, baseX = ax + sy * toCam;
             auto stand = [&](float a, int row, float* v) {
@@ -4029,7 +4039,7 @@ static bool PresentImpl(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swap, int swa
         }
         const float target3[3] = { sCam.absolute ? sCam.ox : scrollX + viewW * 0.5f + sCam.ox,
                                    sCam.absolute ? sCam.oy : sCamGround + sCam.oy,
-                                   sCam.absolute ? sCam.oz : scrollY + 80.0f + sCam.oz };
+                                   sCam.absolute ? sCam.oz : scrollY + 80.0f + sCamGround + sCam.oz };
         const float eye[3] = { target3[0] + sCam.dist * sy * std::cos(pitch), sCam.dist * std::sin(pitch),
                                target3[2] + sCam.dist * cy * std::cos(pitch) };
         static PortVoxelFade fade;
