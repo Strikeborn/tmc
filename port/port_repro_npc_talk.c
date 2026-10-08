@@ -40,6 +40,7 @@
 #include "message.h"
 #include "entity.h"
 #include "kinstone.h"
+#include "item_ids.h"
 #include "subtask.h"
 #include "asm.h"
 #include "port_repro.h"
@@ -284,6 +285,15 @@ void Port_ReproNpcTalk_Tick(unsigned int frame) {
                 Port_DebugAction_GiveAllItems();
                 if (*unlock != '2')
                     Port_DebugAction_AllKinstones();
+            }
+            /* ponytail: debug knob — TMC_LINK_CAP=1: Ezlo met (Link wears the
+             * cap) and the sword on B, for the Link frame recorder. */
+            if (getenv("TMC_LINK_CAP")) {
+                SetGlobalFlag(EZERO_1ST);
+                SetGlobalFlag(START);
+                SetGlobalFlag(TABIDACHI);
+                Port_DebugAction_GiveAllItems();
+                gSave.stats.equipped[SLOT_B] = ITEM_SMITH_SWORD;
             }
         }
         booted = 1;

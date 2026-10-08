@@ -5,72 +5,148 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Voxel Link</title>
 <style>
-  :root { --bg: #1d2a1f; --fg: #e8efe6; --panel: rgba(0,0,0,.45); --accent: #9fdc6c; }
-  @media (prefers-color-scheme: light) { :root { --bg: #dfe9d8; --fg: #1d2a1f; --panel: rgba(255,255,255,.7); --accent: #3c7a1c; } }
+  :root { --bg: #1d2a1f; --fg: #e8efe6; --panel: rgba(0,0,0,.5); --line: rgba(255,255,255,.15); }
+  @media (prefers-color-scheme: light) { :root { --bg: #dfe9d8; --fg: #1d2a1f; --panel: rgba(255,255,255,.75); --line: rgba(0,0,0,.15); } }
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 14px system-ui, sans-serif; overflow: hidden; }
   canvas { display: block; touch-action: none; }
-  #ui { position: fixed; left: 16px; top: 16px; right: 16px; max-width: 420px; background: var(--panel); padding: 12px; border-radius: 8px; }
-  #ui label { margin-right: 12px; white-space: nowrap; }
+  #ui { position: fixed; left: 16px; top: 16px; right: 16px; max-width: 460px; background: var(--panel); padding: 12px; border-radius: 8px; }
+  .row { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; margin-top: 8px; }
+  .row:first-child { margin-top: 0; }
   #ui p { margin: 8px 0 0; opacity: .8; }
-  button, select { font: inherit; }
+  button, select, input { font: inherit; }
+  #edit-help { display: none; border-top: 1px solid var(--line); padding-top: 8px; }
+  body.editing #edit-help { display: block; }
 </style>
 </head>
 <body>
 <div id="ui">
-  <label>Pose <select id="pose"></select></label>
-  <label><input type="checkbox" id="play" checked> Animate</label>
-  <label>Step <span id="step">0</span></label>
-  <p>Drag to orbit, wheel to zoom. Carved from Link's front, back and side sprites.</p>
+  <div class="row">
+    <label>Model <select id="pose"></select></label>
+    <button id="prev" aria-label="Previous step">&lt;</button>
+    <span id="step">1 / 1</span>
+    <button id="next" aria-label="Next step">&gt;</button>
+    <label><input type="checkbox" id="play" checked> Animate</label>
+  </div>
+  <div class="row">
+    View
+    <button data-view="0,0.15">Front</button>
+    <button data-view="0.8,0.35">3/4</button>
+    <button data-view="1.5708,0.1">Side</button>
+    <button data-view="3.1416,0.15">Back</button>
+    <button data-view="0.6,1.3">Top</button>
+    <button data-view="0,0.87">Game</button>
+  </div>
+  <div class="row">
+    <label><input type="checkbox" id="edit"> Edit</label>
+    <input type="color" id="color" value="#f0c060" aria-label="Paint colour">
+    <button id="save">Save edits</button>
+    <span id="count"></span>
+  </div>
+  <p id="edit-help">Click removes a voxel, Shift+click paints it, Alt+click adds one on that face, Ctrl+click picks its colour. Edits are per model and step; "Save edits" downloads edits.json for <code>build.py --edits</code>.</p>
+  <p>Drag to orbit, wheel to zoom.</p>
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script>
 const MODELS = /*MODELS*/null;
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+const SCALE = /*SCALE*/1;
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
 renderer.setPixelRatio(devicePixelRatio);
 document.body.appendChild(renderer.domElement);
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(getComputedStyle(document.documentElement).getPropertyValue('--bg').trim());
 const camera = new THREE.PerspectiveCamera(35, 1, 1, 1000);
-scene.add(new THREE.HemisphereLight(0xffffff, 0x445544, 0.9));
-const sun = new THREE.DirectionalLight(0xffffff, 0.6); sun.position.set(40, 80, 60); scene.add(sun);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x445544, 0.85));
+const sun = new THREE.DirectionalLight(0xffffff, 0.65); sun.position.set(40, 80, 60); scene.add(sun);
 const ground = new THREE.Mesh(new THREE.CircleGeometry(24, 48), new THREE.MeshLambertMaterial({ color: 0x4f7d3a }));
-ground.rotation.x = -Math.PI / 2; ground.position.y = -0.5; scene.add(ground);
+ground.rotation.x = -Math.PI / 2; ground.position.y = -0.5 / SCALE; scene.add(ground);
 
 const poseSel = document.getElementById('pose');
 for (const k of Object.keys(MODELS)) poseSel.add(new Option(k, k));
-const box = new THREE.BoxGeometry(1, 1, 1);
+const box = new THREE.BoxGeometry(1 / SCALE, 1 / SCALE, 1 / SCALE);
 const mat = new THREE.MeshLambertMaterial();
-let mesh = null, step = 0, last = 0;
-function show(pose, s) {
-  const seq = MODELS[pose]; s = s % seq.length; const v = seq[s];
+let edits = {};
+try { edits = JSON.parse(localStorage.getItem('voxel-link-edits') || '{}'); } catch (e) { edits = {}; }
+function keep() { try { localStorage.setItem('voxel-link-edits', JSON.stringify(edits)); } catch (e) {} }
+function stepEdits(pose, s) { ((edits[pose] ||= {})[s] ||= { del: [], set: [] }); return edits[pose][s]; }
+function voxels(pose, s) {
+  const e = edits[pose] && edits[pose][s];
+  let v = MODELS[pose][s].map(p => p.slice());
+  if (!e) return v;
+  const gone = new Set(e.del.map(p => p.join()));
+  const set = new Map(e.set.map(p => [p.slice(0, 3).join(), p.slice(3, 6)]));
+  v = v.filter(p => !gone.has(p.slice(0, 3).join()));
+  for (const p of v) { const c = set.get(p.slice(0, 3).join()); if (c) { p[3] = c[0]; p[4] = c[1]; p[5] = c[2]; set.delete(p.slice(0, 3).join()); } }
+  for (const [k, c] of set) v.push([...k.split(',').map(Number), ...c, 0]);
+  return v;
+}
+let mesh = null, cur = [], step = 0, last = 0;
+function show() {
+  const seq = MODELS[poseSel.value]; step = ((step % seq.length) + seq.length) % seq.length;
+  cur = voxels(poseSel.value, step);
   if (mesh) { scene.remove(mesh); mesh.dispose(); }
-  mesh = new THREE.InstancedMesh(box, mat, v.length);
+  mesh = new THREE.InstancedMesh(box, mat, Math.max(cur.length, 1));
   const m = new THREE.Matrix4(), c = new THREE.Color();
-  v.forEach((p, i) => {
-    m.makeTranslation(p[0], p[1], p[2]); mesh.setMatrixAt(i, m);
+  cur.forEach((p, i) => {
+    m.makeTranslation(p[0] / SCALE, p[1] / SCALE, p[2] / SCALE); mesh.setMatrixAt(i, m);
     c.setRGB(p[3] / 255, p[4] / 255, p[5] / 255); mesh.setColorAt(i, c);
   });
   scene.add(mesh);
-  document.getElementById('step').textContent = s + 1 + ' / ' + seq.length;
+  document.getElementById('step').textContent = (step + 1) + ' / ' + seq.length;
+  document.getElementById('count').textContent = cur.length + ' voxels';
 }
-poseSel.onchange = () => { step = 0; show(poseSel.value, 0); };
+poseSel.onchange = () => { step = 0; show(); };
+document.getElementById('prev').onclick = () => { document.getElementById('play').checked = false; step--; show(); };
+document.getElementById('next').onclick = () => { document.getElementById('play').checked = false; step++; show(); };
 
-let yaw = 0.6, pitch = 0.35, dist = 90, drag = null;
-addEventListener('pointerdown', e => { if (e.target === renderer.domElement) drag = [e.clientX, e.clientY]; });
-addEventListener('pointerup', () => drag = null);
+let yaw = 0.8, pitch = 0.35, dist = 85, drag = null, moved = false;
+for (const b of document.querySelectorAll('[data-view]')) b.onclick = () => { [yaw, pitch] = b.dataset.view.split(',').map(Number); };
+const editBox = document.getElementById('edit');
+editBox.onchange = () => { document.body.classList.toggle('editing', editBox.checked); if (editBox.checked) document.getElementById('play').checked = false; };
+renderer.domElement.addEventListener('pointerdown', e => { drag = [e.clientX, e.clientY]; moved = false; });
+addEventListener('pointerup', e => { if (drag && !moved && editBox.checked) editAt(e); drag = null; });
 addEventListener('pointermove', e => {
   if (!drag) return;
-  yaw -= (e.clientX - drag[0]) * 0.01; pitch = Math.max(-0.2, Math.min(1.4, pitch + (e.clientY - drag[1]) * 0.01));
+  const dx = e.clientX - drag[0], dy = e.clientY - drag[1];
+  if (Math.abs(dx) + Math.abs(dy) > 3) moved = true;
+  yaw -= dx * 0.01; pitch = Math.max(-0.3, Math.min(1.5, pitch + dy * 0.01));
   drag = [e.clientX, e.clientY];
 });
-addEventListener('wheel', e => { dist = Math.max(30, Math.min(250, dist * Math.pow(1.001, e.deltaY))); });
+addEventListener('wheel', e => { dist = Math.max(25, Math.min(250, dist * Math.pow(1.001, e.deltaY))); });
+
+const ray = new THREE.Raycaster(), ndc = new THREE.Vector2();
+function editAt(e) {
+  ndc.set(e.clientX / innerWidth * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+  ray.setFromCamera(ndc, camera);
+  const hit = ray.intersectObject(mesh)[0];
+  if (!hit || hit.instanceId === undefined) return;
+  const p = cur[hit.instanceId], key = p.slice(0, 3), ed = stepEdits(poseSel.value, step);
+  const hex = document.getElementById('color').value, rgb = [1, 3, 5].map(i => parseInt(hex.substr(i, 2), 16));
+  if (e.ctrlKey) {
+    document.getElementById('color').value = '#' + p.slice(3, 6).map(v => v.toString(16).padStart(2, '0')).join('');
+    return;
+  } else if (e.altKey) {
+    const n = hit.face.normal; const k = [key[0] + Math.round(n.x), key[1] + Math.round(n.y), key[2] + Math.round(n.z)];
+    ed.set.push([...k, ...rgb]);
+  } else if (e.shiftKey) {
+    ed.set.push([...key, ...rgb]);
+  } else {
+    ed.del.push(key);
+  }
+  keep(); show();
+}
+document.getElementById('save').onclick = () => {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(edits, null, 1)], { type: 'application/json' }));
+  a.download = 'edits.json'; a.click();
+};
+
 function resize() { renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); }
 addEventListener('resize', resize); resize();
-show(poseSel.value, 0);
+show();
 function frame(t) {
-  if (document.getElementById('play').checked && t - last > 110) { last = t; step++; show(poseSel.value, step); }
-  camera.position.set(Math.sin(yaw) * Math.cos(pitch) * dist, 14 + Math.sin(pitch) * dist, Math.cos(yaw) * Math.cos(pitch) * dist);
-  camera.lookAt(0, 14, 0);
+  if (document.getElementById('play').checked && t - last > 110) { last = t; step++; show(); }
+  camera.position.set(Math.sin(yaw) * Math.cos(pitch) * dist, 13 + Math.sin(pitch) * dist, Math.cos(yaw) * Math.cos(pitch) * dist);
+  camera.lookAt(0, 13, 0);
   renderer.render(scene, camera);
   requestAnimationFrame(frame);
 }
