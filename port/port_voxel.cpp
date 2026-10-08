@@ -3362,6 +3362,191 @@ void BuildMap(void) {
             ~LiftOnExit() { f(); }
         } liftRun{ [&, nRun, base]() { liftFrom(nRun, base); } };
         const bool thin = yb - yt + 1 <= face; /* all face: 8px-deep cap */
+        /* ---- a thatched building (its art mostly warm straw): a stone wall
+         * as tall as the art's stone band at its foot, under a rounded roof
+         * sized so that, seen from the GBA's camera, it covers exactly the
+         * straw rows; every 2-px slice of roof wears the art pixel that view
+         * puts there (dormers, chimney), the gable ends stone under the
+         * eaves and straw along the roof line ---- */
+        int cliffN = 0; /* mostly cliff-tagged: a cliff, not a building (whose back row may be a plateau's edge) */
+        for (int r = yt; r <= yb; ++r)
+            cliffN += CliffTile(x, r);
+        const bool runCliff = cliffN * 2 > yb - yt + 1;
+        if (outdoors && yb - yt >= 1 && !runCliff) {
+            auto visible = [&](int px, int py, bool& top) { /* the 2D game's pixel at room px */
+                const int tx = px >> 4, ty = py >> 4;
+                top = false;
+                if (!inRoom(tx, ty))
+                    return -1;
+                if (Cover(tx, ty)) {
+                    const int ci = TopIndex(tx, ty, px & 15, py & 15, tChar, t8 != 0);
+                    if (ci >= 0) {
+                        top = true;
+                        return (int)gBgPltt[ci];
+                    }
+                }
+                return BottomPixel(tx, ty, px & 15, py & 15, bChar, b8 != 0);
+            };
+            auto straw = [](int c) {
+                const int r = c & 31, g = (c >> 5) & 31, b = (c >> 10) & 31;
+                return c >= 0 && r >= 18 && g >= 10 && b < 12 && r > b + 8;
+            };
+            int warm = 0, all = 0;
+            for (int py = yt * 16; py < (yb + 1) * 16; py += 2)
+                for (int c = 0; c < 16; c += 2) {
+                    bool tp;
+                    const int v = visible(x * 16 + c, py, tp);
+                    all += v >= 0, warm += straw(v);
+                }
+            auto colSpan = [&](int cx, int& ct, int& cb) { /* that column's solid rows round yb */
+                ct = cb = yb;
+                if (!inRoom(cx, yb) || kind[yb * 64 + cx] != 2)
+                    return false;
+                while (ct > 0 && kind[(ct - 1) * 64 + cx] == 2)
+                    --ct;
+                while (cb + 1 < H && kind[(cb + 1) * 64 + cx] == 2)
+                    ++cb;
+                return true;
+            };
+            auto strawRun = [&](int cx) { /* a neighbouring column of the same building */
+                int ct, cb;
+                if (!colSpan(cx, ct, cb))
+                    return false;
+                int w2 = 0, a2 = 0;
+                for (int py = ct * 16; py < (cb + 1) * 16; py += 4)
+                    for (int c = 0; c < 16; c += 4) {
+                        bool tp;
+                        const int v = visible(cx * 16 + c, py, tp);
+                        a2 += v >= 0, w2 += straw(v);
+                    }
+                return a2 > 0 && w2 * 10 >= a2 * 3;
+            };
+            if (all > 0 && warm * 10 >= all * 4) {
+                /* the whole building: neighbouring straw columns share one
+                 * roof (its front and back rows, its wall height) */
+                int gTop = yt, gBot = yb;
+                for (int dir = -1; dir <= 1; dir += 2)
+                    for (int cx = x + dir; strawRun(cx); cx += dir) {
+                        int ct, cb;
+                        colSpan(cx, ct, cb);
+                        gTop = std::min(gTop, ct), gBot = std::max(gBot, cb);
+                    }
+                /* the stone band: rows up from the foot that aren't straw (the
+                 * building's most common) */
+                auto bandOf = [&](int cx) {
+                    int wp = 0;
+                    for (int py = (gBot + 1) * 16 - 1; py >= gTop * 16; --py) {
+                        int w = 0, a = 0;
+                        for (int c = 0; c < 16; ++c) {
+                            bool tp;
+                            const int v = visible(cx * 16 + c, py, tp);
+                            a += v >= 0, w += straw(v);
+                        }
+                        if (a > 0 && w * 10 >= a * 3)
+                            break;
+                        ++wp;
+                    }
+                    return wp;
+                };
+                std::vector<int> bands;
+                for (int dir = -1; dir <= 1; dir += 2)
+                    for (int cx = dir < 0 ? x : x + 1; dir < 0 ? strawRun(cx) || cx == x : strawRun(cx); cx += dir)
+                        bands.push_back(bandOf(cx));
+                std::sort(bands.begin(), bands.end());
+                const int wallPx = bands.empty() ? bandOf(x) : bands[bands.size() / 2];
+                const float hw = std::clamp((float)wallPx, 6.0f, 24.0f);
+                const float R = (gBot - gTop + 1) * 16.0f - wallPx; /* straw rows */
+                const float rz = std::max(8.0f, R / 2.414f), rh = rz * 0.95f;
+                const float zF = (gBot + 1) * 16.0f, zc = zF - rz;
+                const float x0 = x * 16.0f, x1 = x0 + 16;
+                auto prof = [&](float z) { /* roof height over z */
+                    const float t = (z - zc) / rz;
+                    return t <= -1.0f || t >= 1.0f ? hw : hw + rh * std::sqrt(1.0f - t * t);
+                };
+                auto rowQuad = [&](const float (&c)[4][3], int row, bool gableX, float colX) {
+                    /* a quad wearing art row `row` across this column (or one
+                     * pixel column colX for gable ends), both layers */
+                    bool tp;
+                    const int ty = row >> 4;
+                    const float u0 = gableX ? colX : x0, u1 = gableX ? colX : x1, v = row + 0.5f;
+                    Quad(sMapVerts, kMaxMapVerts, n, c, u0, v, u1, v, 0, 0u, bChar, b8);
+                    if (inRoom(x, ty) && Cover(x, ty)) {
+                        (void)tp;
+                        float c2[4][3];
+                        std::memcpy(c2, c, sizeof(c2));
+                        for (auto& q : c2)
+                            q[1] += 0.2f;
+                        Quad(sMapVerts, kMaxMapVerts, n, c2, u0, v, u1, v, 0, 128u, tChar, t8);
+                    }
+                };
+                const int artTop = gTop * 16, artBot = (gBot + 1) * 16 - 1;
+                auto artRowAt = [&](float z, float h) { return std::clamp((int)(z - h), artTop, artBot); };
+                /* front wall: the stone band stood up */
+                for (int k = 0; k < (int)hw; ++k) {
+                    const float h0 = (float)k, h1 = h0 + 1;
+                    const float c[4][3] = { { x0, h1, zF }, { x1, h1, zF }, { x0, h0, zF }, { x1, h0, zF } };
+                    rowQuad(c, artRowAt(zF, h0 + 0.5f), false, 0);
+                }
+                /* roof: 1-px strips from the eaves back over the ridge, each
+                 * wearing the art rows the GBA's view puts on it (row = z - h)
+                 * so the thatch, dormers and chimney run on unbroken; behind
+                 * the ridge (never shown) the front's art mirrored */
+                const bool westOpen = !strawRun(x - 1), eastOpen = !strawRun(x + 1);
+                auto vOf = [&](float z) { return std::clamp(z - prof(z), (float)artTop, (float)artBot + 1.0f); };
+                auto strip = [&](const float (&c)[4][3], float va, float vb, bool gable, float colX) {
+                    const float u0 = gable ? colX : x0, u1 = gable ? colX : x1;
+                    Quad(sMapVerts, kMaxMapVerts, n, c, u0, va, u1, vb, 0, 0u, bChar, b8);
+                    const int ty = (int)std::floor((va + vb) * 0.5f) >> 4;
+                    if (inRoom(x, ty) && Cover(x, ty)) {
+                        float c2[4][3];
+                        std::memcpy(c2, c, sizeof(c2));
+                        for (auto& q : c2)
+                            q[1] += 0.2f;
+                        Quad(sMapVerts, kMaxMapVerts, n, c2, u0, va, u1, vb, 0, 128u, tChar, t8);
+                    }
+                };
+                float vRidge = vOf(zc);
+                for (float z = zF; z > zc - rz + 0.01f; z -= 1.0f) {
+                    const float za = std::max(z - 1.0f, zc - rz);
+                    const float h1 = prof(z - 0.001f), h0 = prof(za + 0.001f);
+                    float v1 = vOf(z), v0 = vOf(za);
+                    if (za < zc) { /* behind the ridge: the plain thatch near the ridge, repeated */
+                        const float band = std::max(4.0f, (vOf(zc + rz * 0.5f) - vRidge));
+                        auto back = [&](float zz) { return vRidge + std::fmod(zc - zz, band); };
+                        v1 = back(z), v0 = back(za);
+                        if (v0 < v1)
+                            v0 = v1 + 1.0f;
+                    }
+                    const float c[4][3] = { { x0, h0, za }, { x1, h0, za }, { x0, h1, z }, { x1, h1, z } };
+                    strip(c, v0, v1, false, 0);
+                    for (int e = 0; e < 2; ++e) {
+                        if (!(e ? eastOpen : westOpen))
+                            continue;
+                        const float xs = e ? x1 : x0, hm = std::max(h0, h1);
+                        const float g[4][3] = { { xs, hm, za }, { xs, hm, z }, { xs, 0, za }, { xs, 0, z } };
+                        strip(g, vOf((z + za) * 0.5f) - hm * 0.5f, vOf((z + za) * 0.5f), true, e ? x1 - 1.5f : x0 + 1.5f);
+                    }
+                }
+                /* the back: a wall under the roof's rear eaves, the stone of the
+                 * building's east end (no door there) */
+                {
+                    int ex = x;
+                    while (strawRun(ex + 1))
+                        ++ex;
+                    const float zb = zc - rz, ue = ex * 16.0f + 8.0f;
+                    for (int k = 0; k < (int)hw; ++k) {
+                        const float c[4][3] = { { x1, k + 1.0f, zb }, { x0, k + 1.0f, zb }, { x1, (float)k, zb }, { x0, (float)k, zb } };
+                        const float v = (float)artRowAt(zF, k + 0.5f) + 0.5f;
+                        Quad(sMapVerts, kMaxMapVerts, n, c, ue - 4.0f, v, ue + 4.0f, v, 0, 0u, bChar, b8);
+                    }
+                }
+                /* ground round its back, where the art's roof covered it */
+                for (int r = yt; r < yb; ++r)
+                    if (r * 16 + 16 <= zc - rz)
+                        underlay(x, r);
+                continue;
+            }
+        }
         /* a run of tiles all solid on the same half stands on that half */
         int hx = HalfX(x, yt);
         for (int r = yt; r <= yb && hx; ++r)
