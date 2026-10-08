@@ -1145,17 +1145,21 @@ void BuildMap(void) {
     };
     /* A prop as a real voxel model: each art row is spun round the tile's
      * centre into a disc as wide as the row (a trunk becomes a post, leaves a
-     * ball), in 2-px voxels. Every voxel wears the art pixel at the
+     * ball). Every voxel wears the art pixel at the
      * same distance out from the centre on its side, so the picture reads the
      * same from any angle. Only faces with no neighbour are drawn. */
+    int thinProps = 0; /* props cut from their ground in this room (set before pass 2) */
     auto voxelProp = [&](int x, int y, Uint32 slot) {
         const int ox = (int)((slot - 1) % 16) * 16, oy = (int)((slot - 1) / 16) * 16;
         auto on = [&](int c, int r) {
             return c >= 0 && c < 16 && r >= 0 && r < 16 && sMaskPixels[(oy + r) * 256 + ox + c] != 0;
         };
-        /* 2-px voxels (8 per side): a voxel covers art rows 2k, 2k+1 */
-        constexpr int V = 2, G = 16 / V;
-        float radius[G];
+        /* Round props whose outline closes them in (bushes, pots) fill solid
+         * in 2-px voxels; props cut from their ground (saplings) keep their
+         * sparse shape in 1-px voxels (there are few of them). */
+        const bool round = sPropOutlined[slot - 1];
+        const int V = round || thinProps > 24 ? 2 : 1, G = 16 / V; /* 1 px only while they're few */
+        float radius[16];
         for (int k = 0; k < G; ++k) {
             radius[k] = -1.0f;
             for (int r = k * V; r < k * V + V; ++r)
@@ -1171,9 +1175,8 @@ void BuildMap(void) {
         };
         /* A voxel exists where the art has a pixel at that distance from the
          * centre on that side: a trunk stays a post, sparse branches become
-         * rings and spokes, not solid plates. Outlined (round) props fill. */
-        const bool fillRows = sPropOutlined[slot - 1];
-        static bool occ[G][G][G]; /* [row][vx][vz] */
+         * rings and spokes, not solid plates. Round props fill. */
+        static bool occ[16][16][16]; /* [row][vx][vz] */
         for (int k = 0; k < G; ++k)
             for (int vx = 0; vx < G; ++vx)
                 for (int vz = 0; vz < G; ++vz) {
@@ -1184,10 +1187,16 @@ void BuildMap(void) {
                     for (int r = k * V; r < k * V + V && !art; ++r)
                         for (int dc = 0; dc < V && !art; ++dc)
                             art = on(c - side * dc, r);
-                    occ[k][vx][vz] = radius[k] >= 0.0f && d <= radius[k] + V * 0.5f && (fillRows || art);
+                    occ[k][vx][vz] = radius[k] >= 0.0f && d <= radius[k] + V * 0.5f && (round || art);
                 }
         auto at = [&](int k, int vx, int vz) {
             return k >= 0 && k < G && vx >= 0 && vx < G && vz >= 0 && vz < G && occ[k][vx][vz];
+        };
+        /* A leaf colour for a round prop: not the dark outline or the brown
+         * soil at its foot (those would ring it). */
+        auto leafy = [&](int c, int r) {
+            const int p = BottomPixel(x, y, c, r, bChar, b8 != 0);
+            return p >= 0 && !Dark555(p) && ((p >> 5) & 31) >= (p & 31);
         };
         const Uint32 params = baseParams(0, 0);
         const float x0 = x * 16.0f, z0 = y * 16.0f;
@@ -1196,16 +1205,31 @@ void BuildMap(void) {
                 for (int vz = 0; vz < G; ++vz) {
                     if (!occ[k][vx][vz])
                         continue;
-                    /* colour: the art pixel this far out on this side (upper row
-                     * first), falling back toward the centre to one the art has */
+                    /* colour: the art pixel this far out on this side, from a
+                     * row that varies voxel to voxel (leaves read mottled, not
+                     * in rings), falling back toward the centre */
                     int side;
-                    int c = column(vx, vz, side);
-                    int r = k * V;
-                    if (!on(c, r) && on(c, r + 1))
-                        ++r;
-                    while (!on(c, r) && c != (side > 0 ? 7 : 8))
-                        c -= side;
-                    const float u = x0 + c + 0.5f, v = z0 + r + 0.5f;
+                    const int c0 = column(vx, vz, side);
+                    const unsigned h = (unsigned)(vx * 73856093u ^ vz * 19349663u ^ k * 83492791u);
+                    const int jitter = round ? (int)(h % 3u) - 1 : 0;
+                    int cu = -1, rv = 0;
+                    for (int pass = 0; pass < 2 && cu < 0; ++pass)
+                        for (int j : { jitter, 0, -jitter }) {
+                            const int r = std::clamp(k * V + (V > 1 ? (int)(h >> 4) % V : 0) + j, 0, 15);
+                            for (int c = c0;; c -= side) {
+                                if (on(c, r) && (pass == 1 || !round || leafy(c, r))) {
+                                    cu = c, rv = r;
+                                    break;
+                                }
+                                if (c == (side > 0 ? 7 : 8))
+                                    break;
+                            }
+                            if (cu >= 0)
+                                break;
+                        }
+                    if (cu < 0)
+                        cu = c0, rv = k * V;
+                    const float u = x0 + cu + 0.5f, v = z0 + rv + 0.5f;
                     const float px = x0 + vx * V, pz = z0 + vz * V, top = 16.0f - k * V, bot = top - V;
                     const float px1 = px + V, pz1 = pz + V;
                     auto face = [&](const float (&q)[4][3]) {
@@ -1328,6 +1352,7 @@ void BuildMap(void) {
         int x, yt, yb, face, foot; /* foot: first footprint row (tile units) */
         float faceH, topH;
         bool ledge;
+        bool floating; /* only canopy overhang: walkable under, art floats at head height */
     };
     std::vector<Run> runs;
     /* Trunk rows: mostly dark art under foliage. A tree's middle trunk tile
@@ -1380,6 +1405,23 @@ void BuildMap(void) {
                 --y;
             }
             const int yt = y + 1;
+            /* Overhang rows at the column's south end (canopy over walkable
+             * ground: you walk under it) split off as a floating canopy, so
+             * the tree's wall stands only where its collision is. */
+            {
+                int ys = yb;
+                while (outdoors && ys > yt && geom[ys * 64 + x] == 2)
+                    --ys;
+                if (ys < yb) {
+                    Run fr;
+                    fr.x = x, fr.yt = ys + 1, fr.yb = yb, fr.face = 1, fr.foot = ys + 1;
+                    fr.faceH = 16.0f, fr.topH = 16.0f, fr.ledge = false, fr.floating = true;
+                    for (int r = fr.yt; r <= fr.yb; ++r)
+                        kind[r * 64 + x] = 2, hmap[r * 64 + x] = 0.0f;
+                    runs.push_back(fr);
+                    yb = ys;
+                }
+            }
             /* Big trees' bottom rows are cast shadow and trunk: mostly dark
              * art under the canopy. They lie on the ground, the canopy box
              * stands above them. */
@@ -1399,10 +1441,13 @@ void BuildMap(void) {
              * tiles for full walls). A box on the room's north edge keeps its
              * top back to the edge so it meets the margin beyond. */
             rn.foot = len > rn.face ? (yt == 0 ? 0 : yt + rn.face) : yb;
+            rn.floating = outdoors;
+            for (int r = yt; r <= yb; ++r)
+                rn.floating &= geom[r * 64 + x] == 2;
             for (int r = yt; r <= yb; ++r)
                 kind[r * 64 + x] = 2;
             for (int b = rn.foot; b <= yb; ++b)
-                hmap[b * 64 + x] = rn.topH;
+                hmap[b * 64 + x] = rn.floating ? 0.0f : rn.topH; /* a floating canopy is no wall */
             runs.push_back(rn);
         }
     }
@@ -1437,6 +1482,9 @@ void BuildMap(void) {
         }
     }
     auto hAt = [&](int x, int b) { return inRoom(x, b) ? hmap[b * 64 + x] : 0.0f; };
+
+    for (int i = 0; i < sPropCount; ++i)
+        thinProps += !sPropOutlined[i];
 
     /* ---- pass 2: draw ---- */
     for (int y = 0; y < H; ++y)
@@ -1489,7 +1537,7 @@ void BuildMap(void) {
         /* Ground where it can be seen: behind the footprint, and wherever
          * silhouettes are cut. */
         for (int r = yt; r <= yb; ++r) {
-            if (!anyMask && r >= rn.foot)
+            if (!anyMask && !rn.floating && r >= rn.foot)
                 continue;
             if (r < rn.foot) {
                 /* Behind the footprint the 2D art has no ground (the object
@@ -1519,6 +1567,13 @@ void BuildMap(void) {
             }
         const Uint32 fillP = fillN ? (Uint32)fill + 1 : 0;
 
+        if (rn.floating) {
+            /* Canopy over walkable ground: its art floats at head height over
+             * its own cells, cut to the leaves, with the ground beneath. */
+            for (int r = yt; r <= yb; ++r)
+                flatV(x, r, kTopLayerLift, r * 16.0f, r * 16.0f + 16, rowMask[r], 0);
+            continue;
+        }
         /* Front wall: the southmost `face` rows stood up. */
         for (int i = 0; i < face; ++i)
             wallV(x, yb - i, zFace, i * rn.faceH, rn.faceH, rowMask[yb - i], fillP);
