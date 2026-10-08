@@ -1022,8 +1022,14 @@ void Port_QuickSave_AutoTick(void) {
          * ends up (did collision come back with the state?), and exit. */
         const char* shot = getenv("TMC_REPRO_LOAD_SHOT");
         if (done && shot && *shot) {
+            /* the 3D map rebuilds ~20 frames after a change; 40 is plenty */
+            static int at = -1;
+            if (at < 0) {
+                const char* a = getenv("TMC_REPRO_LOAD_SHOT_AFTER");
+                at = a && *a ? atoi(a) : 40;
+            }
             ++after;
-            if (after == 120) {
+            if (after == at) {
                 char path[512];
                 snprintf(path, sizeof(path), "%s/3d.png", shot);
                 Port_Voxel_RequestShot(path);
@@ -1034,12 +1040,12 @@ void Port_QuickSave_AutoTick(void) {
                         gPlayerEntity.base.y.HALF.HI);
             }
             const char* walk = getenv("TMC_REPRO_LOAD_WALK");
-            if (walk && after > 130 && after < 190)
+            if (walk && after > at + 10 && after < at + 70)
                 Port_Config_TestForceEdge(*walk == 'u'   ? PORT_INPUT_UP
                                           : *walk == 'd' ? PORT_INPUT_DOWN
                                           : *walk == 'l' ? PORT_INPUT_LEFT
                                                          : PORT_INPUT_RIGHT);
-            if (after == 200) {
+            if (after == (walk ? at + 80 : at + 5)) {
                 fprintf(stderr, "[quicksave] repro: after walk link=%d,%d\n", gPlayerEntity.base.x.HALF.HI,
                         gPlayerEntity.base.y.HALF.HI);
                 fflush(stderr);

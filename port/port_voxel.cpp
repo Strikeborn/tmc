@@ -1260,6 +1260,15 @@ void BuildMap(void) {
         auto at = [&](int k, int vx, int vz) {
             return k >= 0 && k < G && vx >= 0 && vx < G && vz >= 0 && vz < G && srcC[k][vx][vz] >= 0;
         };
+        /* Stand on the ground: the rows left out at the foot (soil, outline,
+         * shadow) would leave it floating, so drop it to 1 px into the floor. */
+        int lowest = -1;
+        for (int k = 0; k < G; ++k)
+            for (int vx = 0; vx < G; ++vx)
+                for (int vz = 0; vz < G; ++vz)
+                    if (srcC[k][vx][vz] >= 0)
+                        lowest = k;
+        const float drop = lowest >= 0 ? (G - 1 - lowest) * V + 1.0f : 0.0f;
         const Uint32 params = baseParams(0, 0);
         const float x0 = x * 16.0f, z0 = y * 16.0f;
         for (int k = 0; k < G; ++k)
@@ -1268,7 +1277,7 @@ void BuildMap(void) {
                     if (srcC[k][vx][vz] < 0)
                         continue;
                     const float u = x0 + srcC[k][vx][vz] + 0.5f, v = z0 + srcR[k][vx][vz] + 0.5f;
-                    const float px = x0 + vx * V, pz = z0 + vz * V, top = 16.0f - k * V, bot = top - V;
+                    const float px = x0 + vx * V, pz = z0 + vz * V, top = 16.0f - k * V - drop, bot = top - V;
                     const float px1 = px + V, pz1 = pz + V;
                     auto face = [&](const float (&q)[4][3]) {
                         Quad(sMapVerts, kMaxMapVerts, n, q, u, v, u, v, 0, 0u, bChar, params);
@@ -1409,15 +1418,160 @@ void BuildMap(void) {
                     trunk[t] = 2; /* 2 = flanked */
             }
     }
-    static Uint8 kind[64 * 64]; /* 0 floor, 1 prop, 2 box, 3 trunk (flat) */
+    /* ---- trees as voxel objects ----
+     * A tree is a connected cluster of leafy solid tiles (and canopy overhang)
+     * with trunk rows at its foot, small enough to be one plant (forest walls
+     * stay boxes). Its tiles leave the column runs and become one voxel
+     * object (treeVoxels, pass 2), so a ledge above it no longer merges in. */
+    struct TreeObj {
+        int x0, y0, x1, y1;
+    };
+    std::vector<TreeObj> trees;
+    static Uint8 treeOf[64 * 64]; /* 0 none, 1.. tree index + 1, 255 leafy but not a tree */
+    std::memset(treeOf, 0, sizeof(treeOf));
+    if (outdoors) {
+        auto leafyTile = [&](int x, int y) {
+            const int t = y * 64 + x;
+            /* leaves on the overhead layer (garden crops are leafy too, but
+             * drawn on the ground layer) or the trunk under them */
+            return inRoom(x, y) && geom[t] && (trunk[t] || (Cover(x, y) && Foliage(x, y)));
+        };
+        static int queue[64 * 64];
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                if (treeOf[y * 64 + x] || !leafyTile(x, y))
+                    continue;
+                int qn = 0, head = 0, trunks = 0;
+                TreeObj tr = { x, y, x, y };
+                treeOf[y * 64 + x] = 254; /* visiting */
+                queue[qn++] = y * 64 + x;
+                while (head < qn) {
+                    const int t = queue[head++], tx = t % 64, ty = t / 64;
+                    trunks += trunk[t] != 0;
+                    tr.x0 = std::min(tr.x0, tx), tr.x1 = std::max(tr.x1, tx);
+                    tr.y0 = std::min(tr.y0, ty), tr.y1 = std::max(tr.y1, ty);
+                    static const int kNb[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+                    for (const auto& d : kNb) {
+                        const int nx = tx + d[0], ny = ty + d[1];
+                        if (leafyTile(nx, ny) && !treeOf[ny * 64 + nx]) {
+                            treeOf[ny * 64 + nx] = 254;
+                            queue[qn++] = ny * 64 + nx;
+                        }
+                    }
+                }
+                /* Trees standing together share leaves: each run of trunk tiles
+                 * along a row is one tree and owns the leaves above it (the
+                 * nearest trunk below a tile, in its columns or close by). */
+                struct Group {
+                    int x0, x1, row;
+                    float cx; /* trunk centre, room px */
+                };
+                std::vector<Group> groups;
+                for (int i = 0; i < qn; ++i) {
+                    const int t = queue[i], tx = t % 64, ty = t / 64;
+                    if (!trunk[t] || (tx > 0 && trunk[t - 1] && treeOf[t - 1] == 254))
+                        continue; /* start of a trunk run only */
+                    int ex = tx;
+                    while (ex + 1 < W && trunk[t + (ex + 1 - tx)] && treeOf[t + (ex + 1 - tx)] == 254)
+                        ++ex;
+                    /* Trees side by side share a trunk row: each brown bark
+                     * column cluster in that row's art is its own tree. */
+                    int start = -1, last = -100;
+                    const int px0 = tx * 16, px1 = (ex + 1) * 16;
+                    /* bark spans; roots and branches are brown too, so spans
+                     * closer than a tree's half-width (40 px) are one trunk */
+                    std::vector<std::pair<int, int>> spans;
+                    auto flush = [&](int a, int b) {
+                        if (b - a < 2)
+                            return;
+                        if (!spans.empty() && (a + b) / 2 - (spans.back().first + spans.back().second) / 2 < 40)
+                            spans.back().second = b;
+                        else
+                            spans.push_back({ a, b });
+                    };
+                    for (int px = px0; px < px1; ++px) {
+                        int bark = 0;
+                        for (int py = 0; py < 16; ++py) {
+                            const int c = BottomPixel(px >> 4, ty, px & 15, py, bChar, b8 != 0);
+                            bark += c >= 0 && !Dark555(c) && (c & 31) > ((c >> 5) & 31);
+                        }
+                        if (bark >= 3) {
+                            if (start < 0 || px - last > 4) {
+                                if (start >= 0)
+                                    flush(start, last);
+                                start = px;
+                            }
+                            last = px;
+                        }
+                    }
+                    if (start >= 0)
+                        flush(start, last);
+                    for (const auto& sp : spans)
+                        groups.push_back({ std::max(tx, sp.first / 16), std::min(ex, sp.second / 16), ty,
+                                           (sp.first + sp.second + 1) * 0.5f });
+                    if (spans.empty())
+                        groups.push_back({ tx, ex, ty, (px0 + px1) * 0.5f });
+                }
+                std::vector<int> owner(qn, -1);
+                for (int i = 0; i < qn; ++i) {
+                    const int tx = queue[i] % 64, ty = queue[i] / 64;
+                    int best = -1, bestCost = 1 << 30;
+                    for (int g = 0; g < (int)groups.size(); ++g) {
+                        if (groups[g].row < ty)
+                            continue;
+                        /* the nearest trunk (by its centre) at most 2 tiles out
+                         * and 3 rows down: a crown is ~4 wide, ~3 tall */
+                        const float dpx = std::fabs(tx * 16 + 8 - groups[g].cx);
+                        const int cost = (int)dpx + (groups[g].row - ty) * 8;
+                        if (dpx <= 40.0f && groups[g].row - ty <= 3 && cost < bestCost)
+                            bestCost = cost, best = g;
+                    }
+                    owner[i] = best;
+                }
+                for (size_t g = 0; g < groups.size(); ++g) {
+                    TreeObj o = { 64, 64, -1, -1 };
+                    int tiles = 0;
+                    for (int i = 0; i < qn; ++i)
+                        if (owner[i] == (int)g) {
+                            const int tx = queue[i] % 64, ty = queue[i] / 64;
+                            o.x0 = std::min(o.x0, tx), o.x1 = std::max(o.x1, tx);
+                            o.y0 = std::min(o.y0, ty), o.y1 = std::max(o.y1, ty);
+                            ++tiles;
+                        }
+                    const bool ok = tiles >= 3 && o.x1 - o.x0 < 12 && o.y1 - o.y0 < 8 && trees.size() < 250;
+                    if (std::getenv("TMC_VOXEL_DUMPMAP"))
+                        std::fprintf(stderr, "[voxel-tree] trunk %d..%d row %d: %d..%d x %d..%d, %d tiles -> %s\n",
+                                     groups[g].x0, groups[g].x1, groups[g].row, o.x0, o.x1, o.y0, o.y1, tiles,
+                                     ok ? "tree" : "not a tree");
+                    if (ok) {
+                        trees.push_back(o);
+                        for (int i = 0; i < qn; ++i)
+                            if (owner[i] == (int)g)
+                                treeOf[queue[i]] = (Uint8)trees.size();
+                    }
+                }
+                (void)trunks;
+                for (int i = 0; i < qn; ++i)
+                    if (treeOf[queue[i]] == 254)
+                        treeOf[queue[i]] = 255;
+            }
+        for (auto& v : treeOf)
+            if (v == 255)
+                v = 0;
+    }
+    auto inTree = [&](int x, int y) { return inRoom(x, y) && treeOf[y * 64 + x] != 0; };
+    static Uint8 kind[64 * 64]; /* 0 floor, 1 prop, 2 box, 3 trunk (flat), 4 under a voxel tree */
     static Uint32 propSlot[64 * 64];
     static float hmap[64 * 64];
     std::memset(kind, 0, sizeof(kind));
     std::memset(hmap, 0, sizeof(hmap));
+    for (int t = 0; t < 64 * 64; ++t)
+        if (treeOf[t])
+            kind[t] = 4;
     for (int x = 0; x < W; ++x) {
         int y = H - 1;
         while (y >= 0) {
-            if (!Geom(x, y) || kind[y * 64 + x] == 1) { /* 1: a prop found on top of a run */
+            if (!Geom(x, y) || kind[y * 64 + x] == 1 || kind[y * 64 + x] == 4) { /* 1: a prop on top of a run, 4: a tree */
                 --y;
                 continue;
             }
@@ -1433,7 +1587,7 @@ void BuildMap(void) {
              * top of the run (a sapling planted against a tree's trunk) may be
              * its own prop: the run ends below it (the scan skips it next).
              * Only on top of trees: walls change type row to row too. */
-            while (y >= 0 && Geom(x, y)) {
+            while (y >= 0 && Geom(x, y) && !inTree(x, y)) {
                 if (BottomTileType(y * 64 + x) != BottomTileType((y + 1) * 64 + x) && outdoors &&
                     (Cover(x, y + 1) || Foliage(x, y + 1)) && isProp(x, y)) {
                     kind[y * 64 + x] = 1;
@@ -1504,6 +1658,16 @@ void BuildMap(void) {
                 }
                 std::fputc('\n', f);
             }
+            std::fprintf(f, "geom (0 walk, 1 solid, 2 overhang) collision(hex) actTile(hex)\n");
+            for (int y = 0; y < H; ++y) {
+                std::fprintf(f, "%2d ", y);
+                for (int x = 0; x < W; ++x) {
+                    const int t = y * 64 + x;
+                    std::fprintf(f, "%d%02x%02x ", geom[t], gMapBottom.collisionData[t] & 0xFF,
+                                 gMapBottom.actTiles[t] & 0xFF);
+                }
+                std::fputc('\n', f);
+            }
             for (int y = 0; y < H; ++y)
                 for (int x = 0; x < W; ++x)
                     if (kind[y * 64 + x] == 1) {
@@ -1539,6 +1703,135 @@ void BuildMap(void) {
     }
     auto hAt = [&](int x, int b) { return inRoom(x, b) ? hmap[b * 64 + x] : 0.0f; };
 
+    /* A tree as a voxel object, from its own art and the GBA's top-down view:
+     * a screen pixel row there is z - h (nearer the camera is lower on the
+     * screen, so is higher up). The canopy is a rounded body over the trunk
+     * whose screen footprint is the art's leaves: its depth and height come
+     * from how many rows the leaves span (a round crown: radius = rows / 4,
+     * so it spans exactly those rows), its width from the leaves' width, and
+     * every voxel wears the art pixel it lands on in that view, so from the
+     * GBA's own camera it reads as the 2D tree and from anywhere else its
+     * leaves stay where they were drawn. The trunk
+     * is a post under the crown at the trunk tiles. 2-px voxels. */
+    auto treeVoxels = [&](const TreeObj& tr, int id) {
+        constexpr int V = 2;
+        const int X0 = tr.x0 * 16, X1 = (tr.x1 + 1) * 16, Y0 = tr.y0 * 16, Y1 = (tr.y1 + 1) * 16;
+        /* leaves: the overhead layer's opaque pixels on the tree's tiles */
+        auto leaf = [&](int sx, int sy) {
+            const int tx = sx >> 4, ty = sy >> 4;
+            return sx >= X0 && sx < X1 && sy >= Y0 && sy < Y1 && treeOf[ty * 64 + tx] == id && Cover(tx, ty) &&
+                   TopIndex(tx, ty, sx & 15, sy & 15, tChar, t8 != 0) >= 0;
+        };
+        int lx0 = X1, lx1 = X0 - 1, ltop = Y1, lbot = Y0 - 1;
+        for (int sy = Y0; sy < Y1; ++sy)
+            for (int sx = X0; sx < X1; ++sx)
+                if (leaf(sx, sy))
+                    lx0 = std::min(lx0, sx), lx1 = std::max(lx1, sx), ltop = std::min(ltop, sy),
+                    lbot = std::max(lbot, sy);
+        if (lx1 < lx0)
+            return;
+        /* the trunk: tiles marked trunk on the tree's bottom rows */
+        int tx0 = 64, tx1 = -1, trow = -1;
+        for (int ty = tr.y1; ty >= tr.y0 && trow < 0; --ty)
+            for (int tx = tr.x0; tx <= tr.x1; ++tx)
+                if (treeOf[ty * 64 + tx] == id && trunk[ty * 64 + tx])
+                    tx0 = std::min(tx0, tx), tx1 = std::max(tx1, tx), trow = ty;
+        const float ground = (trow >= 0 ? trow + 1 : tr.y1 + 1) * 16.0f; /* where it stands */
+        const float zc = ground - 8.0f;
+        /* The leaves span rows = 2 depth + 2 height (screen row = z - h). A
+         * broad tree has a deep crown: depth follows its width, height takes
+         * what is left of the rows. */
+        const float rows = (float)(lbot - ltop + 1), xc = (lx0 + lx1 + 1) * 0.5f, rx = (lx1 - lx0 + 1) * 0.5f;
+        const float rz = std::clamp(std::max(rows / 4.0f, rx * 0.45f), 8.0f, 48.0f);
+        const float rh = std::clamp(rows / 2.0f - rz, 8.0f, 48.0f);
+        const float h0 = std::max(6.0f, zc + rz - (float)lbot); /* crown's underside */
+        const float hc = h0 + rh;
+        const int NX = (int)std::ceil(2 * rx / V) + 1, NZ = (int)std::ceil(2 * rz / V) + 1,
+                  NH = (int)std::ceil(2 * rh / V) + 1;
+        static Uint8 occ[128][64][64]; /* [x][h][z]: 0 empty, 1 crown, 2 trunk */
+        const int nx = std::min(NX, 128), nz = std::min(NZ, 64), nh = std::min(NH, 64);
+        for (int i = 0; i < nx; ++i)
+            for (int j = 0; j < nh; ++j)
+                for (int k = 0; k < nz; ++k) {
+                    const float px = xc - rx + (i + 0.5f) * V, ph = hc - rh + (j + 0.5f) * V,
+                                pz = zc - rz + (k + 0.5f) * V;
+                    const float e = ((px - xc) / rx) * ((px - xc) / rx) + ((ph - hc) / rh) * ((ph - hc) / rh) +
+                                    ((pz - zc) / rz) * ((pz - zc) / rz);
+                    occ[i][j][k] = e <= 1.0f ? 1 : 0;
+                }
+        auto at = [&](int i, int j, int k) {
+            return i >= 0 && i < nx && j >= 0 && j < nh && k >= 0 && k < nz && occ[i][j][k];
+        };
+        /* face colour: the art pixel the voxel lands on in the GBA's view */
+        auto face = [&](const float (&q)[4][3], float px, float ph, float pz) {
+            const int sx = (int)px;
+            int sy = (int)(pz - ph);
+            /* crown voxels landing off the leaves (on a ledge behind) take the
+             * nearest leaf pixel in their column */
+            if (ph > h0 - 1.0f && !leaf(sx, sy))
+                for (int d = 1; d < 24; ++d) {
+                    if (leaf(sx, sy + d)) {
+                        sy += d;
+                        break;
+                    }
+                    if (leaf(sx, sy - d)) {
+                        sy -= d;
+                        break;
+                    }
+                }
+            const int tx = sx >> 4, ty = sy >> 4;
+            const bool top = inRoom(tx, ty) && Cover(tx, ty) && TopIndex(tx, ty, sx & 15, sy & 15, tChar, t8 != 0) >= 0;
+            Quad(sMapVerts, kMaxMapVerts, n, q, sx + 0.5f, sy + 0.5f, sx + 0.5f, sy + 0.5f, 0, top ? 128u : 0u,
+                 top ? tChar : bChar, top ? t8 : b8);
+        };
+        auto emitBox = [&](float x0, float x1, float h0b, float h1b, float z0, float z1, bool nTop, bool nBot,
+                           bool nS, bool nN, bool nW, bool nE, float cx, float ch, float cz) {
+            if (nTop) {
+                const float q[4][3] = { { x0, h1b, z0 }, { x1, h1b, z0 }, { x0, h1b, z1 }, { x1, h1b, z1 } };
+                face(q, cx, h1b - 0.5f, cz);
+            }
+            if (nBot) {
+                const float q[4][3] = { { x0, h0b, z1 }, { x1, h0b, z1 }, { x0, h0b, z0 }, { x1, h0b, z0 } };
+                face(q, cx, h0b + 0.5f, cz);
+            }
+            if (nS) {
+                const float q[4][3] = { { x0, h1b, z1 }, { x1, h1b, z1 }, { x0, h0b, z1 }, { x1, h0b, z1 } };
+                face(q, cx, ch, z1 - 0.5f);
+            }
+            if (nN) {
+                const float q[4][3] = { { x1, h1b, z0 }, { x0, h1b, z0 }, { x1, h0b, z0 }, { x0, h0b, z0 } };
+                face(q, cx, ch, z0 + 0.5f);
+            }
+            if (nW) {
+                const float q[4][3] = { { x0, h1b, z0 }, { x0, h1b, z1 }, { x0, h0b, z0 }, { x0, h0b, z1 } };
+                face(q, x0 + 0.5f, ch, cz);
+            }
+            if (nE) {
+                const float q[4][3] = { { x1, h1b, z1 }, { x1, h1b, z0 }, { x1, h0b, z1 }, { x1, h0b, z0 } };
+                face(q, x1 - 0.5f, ch, cz);
+            }
+        };
+        for (int i = 0; i < nx; ++i)
+            for (int j = 0; j < nh; ++j)
+                for (int k = 0; k < nz; ++k) {
+                    if (!occ[i][j][k])
+                        continue;
+                    const float x0 = xc - rx + i * V, h0b = hc - rh + j * V, z0 = zc - rz + k * V;
+                    emitBox(x0, x0 + V, h0b, h0b + V, z0, z0 + V, !at(i, j + 1, k), !at(i, j - 1, k),
+                            !at(i, j, k + 1), !at(i, j, k - 1), !at(i - 1, j, k), !at(i + 1, j, k), x0 + V * 0.5f,
+                            h0b + V * 0.5f, z0 + V * 0.5f);
+                }
+        /* trunk: a post from the ground into the crown, as wide as a third of
+         * the trunk tiles, wearing the trunk art it lands on */
+        if (trow >= 0) {
+            const float tw = std::clamp((tx1 - tx0 + 1) * 16.0f / 3.0f, 6.0f, 20.0f);
+            const float cx = (tx0 + tx1 + 1) * 8.0f;
+            for (float h = 0.0f; h < h0 + 4.0f; h += V)
+                emitBox(cx - tw / 2, cx + tw / 2, h, h + V, zc - tw / 2, zc + tw / 2, false, false, true, true, true,
+                        true, cx, h + 1.0f, zc);
+        }
+    };
+
     /* ---- pass 2: draw ---- */
     for (int y = 0; y < H; ++y)
         for (int x = 0; x < W; ++x) {
@@ -1546,6 +1839,8 @@ void BuildMap(void) {
             if (kind[t] == 1) {
                 underlay(x, y);
                 voxelProp(x, y, propSlot[t]);
+            } else if (kind[t] == 4) {
+                underlay(x, y); /* the voxel tree stands over borrowed ground */
             } else if (kind[t] == 3) {
                 underlay(x, y);
                 flatV(x, y, 0.2f, y * 16.0f, y * 16.0f + 16, 0);
@@ -1575,6 +1870,8 @@ void BuildMap(void) {
                 }
             }
         }
+    for (size_t i = 0; i < trees.size(); ++i)
+        treeVoxels(trees[i], (int)i + 1);
     for (const Run& rn : runs) {
         const int x = rn.x, yt = rn.yt, yb = rn.yb, face = rn.face;
         const float topH = rn.topH, zFace = (yb + 1) * 16.0f;
