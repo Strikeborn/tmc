@@ -340,6 +340,58 @@ def blade_voxels(img, direction: int, scale: int, prof: Profile) -> np.ndarray:
     return out.astype(np.int16)
 
 
+def blade_pixels(img) -> np.ndarray:
+    """(x, y) sprite px of the blade, without the pure-white slash streak."""
+    part = parts_of(img)
+    pts = []
+    for y, x in zip(*np.nonzero(part == METAL)):
+        r, g, b = (c / 255 for c in img[y, x, :3])
+        _, s, v = colorsys.rgb_to_hsv(r, g, b)
+        if not (v > 0.95 and s < 0.08):
+            pts.append((x, y))
+    return np.array(pts, float).reshape(-1, 2)
+
+
+def blade_combined(down, side, scale: int):
+    """The blade in 3D from two of the GBA's top-down views of one swing.
+    With Link facing +z, x to his left, h up (sprite px, feet at the origin):
+      front (down) frame: screen x = x,  screen y - feet = z - h
+      side (right) frame: screen x = z,  screen y - feet = -x - h
+    Each end of the blade (hilt: nearest the hand; tip: farthest) takes x from
+    the front frame, z from the side frame, and h from both. Returns packed
+    voxel rows, or None when a frame shows no blade."""
+    d, s = blade_pixels(down), blade_pixels(side)
+    if len(d) < 2 or len(s) < 2:
+        return None
+    hand = np.array([FOOT_X, HAND_ROW], float)
+
+    def ends(p):
+        dist = np.hypot(*(p - hand).T)
+        return p[dist.argmin()], p[dist.argmax()]
+
+    (dn, df), (sn, sf) = ends(d), ends(s)
+
+    def point(dp, sp, low):
+        x = dp[0] - FOOT_X
+        z = sp[0] - FOOT_X
+        h = ((z - (dp[1] - FOOT_Y)) + (-x - (sp[1] - FOOT_Y))) / 2
+        return np.array([x, max(h, low), z])
+
+    # the hilt is in his hand, never below it; only the tip may dip
+    hilt, tip = point(dn, sn, FOOT_Y - HAND_ROW), point(df, sf, 2.0)
+    colour = np.median(down[d[:, 1].astype(int), d[:, 0].astype(int), :3], axis=0)
+    n = int(np.ceil(np.linalg.norm(tip - hilt) * scale)) + 1
+    rows = set()
+    half = max(1, scale // 2)
+    for t in np.linspace(0, 1, n):
+        c = (hilt + (tip - hilt) * t) * scale
+        for a in range(-half, half):
+            for b in range(-half, half):
+                rows.add((int(c[0]) + a, int(c[1]) + b, int(c[2])))
+    out = np.array([(x, y, z, *colour) for x, y, z in rows], np.int16)
+    return out
+
+
 def carve_pose(img, direction: int, scale: int, prof: Profile, base: dict):
     """One frame from its own picture; the base pictures colour what it can't see.
     The blade is built separately (blade_voxels)."""
@@ -609,8 +661,13 @@ def main() -> int:
                 v = rig_frame(solid_vox, labels, scale, bf, bs, measure(pics[(sprite, anim + DOWN, st)], False),
                               measure(sideimg, True) if sideimg is not None else None)
                 v = surface(v, scale, gap=3 * scale)
-                if pose == "sword":  # the blade as the front swing drew it
-                    v = np.vstack([v, blade_voxels(pics[(sprite, anim + DOWN, st)], DOWN, scale, prof)])
+                if pose == "sword":
+                    # the blade from the front and side swings combined; the
+                    # front swing alone (laid flat) where one shows no blade
+                    blade = blade_combined(pics[(sprite, anim + DOWN, st)], sideimg, scale)                         if sideimg is not None else None
+                    if blade is None:
+                        blade = blade_voxels(pics[(sprite, anim + DOWN, st)], DOWN, scale, prof)
+                    v = np.vstack([v, blade])
                 seq.append(v)
             if seq:
                 models[f"{name}: {pose}, rigged"] = seq
