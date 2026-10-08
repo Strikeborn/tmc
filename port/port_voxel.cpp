@@ -710,6 +710,39 @@ bool SolidTile(int x, int y) {
     }
 }
 
+/* A tile solid on one side only (collision bits per 8x8 quarter: 8 top
+ * left, 4 top right, 2 bottom left, 1 bottom right): a door's jamb, a thin
+ * fence. 1 = the west half stands, 2 = the east half; 0 otherwise. Ledges
+ * you hop down (top/bottom halves) stay floor. */
+int HalfX(int x, int y) {
+    const int t = y * 64 + x;
+    switch (gMapBottom.actTiles[t]) {
+        case 0x74: /* ledge */
+        case 0x0F: /* water, shallows, holes: see SolidTile */
+        case 0x10:
+        case 0x11:
+        case 0x19:
+        case 0xF0:
+            return 0;
+        default:
+            break;
+    }
+    if (TileOverride(t) != PORT_VOXEL_SHAPE_AUTO)
+        return 0;
+    switch (gMapBottom.collisionData[t]) {
+        case 0x0A:
+        case 0x08:
+        case 0x02:
+            return 1;
+        case 0x05:
+        case 0x04:
+        case 0x01:
+            return 2;
+        default:
+            return 0;
+    }
+}
+
 /* Sunk surfaces: water sits a little below the ground so shorelines show a
  * lip; holes drop further. Shallows stay level (Link wades, not swims). */
 float SinkDepth(int x, int y) {
@@ -920,7 +953,7 @@ void BuildMap(void) {
                 for (int i = 0; i < 256; i += 3)
                     op += TopIndex(x, y, i & 15, i >> 4, tChar, t8 != 0) >= 0;
             cover[t] = op >= 70 ? 2 : op > 0 ? 1 : 0;
-            solid[t] = SolidTile(x, y);
+            solid[t] = SolidTile(x, y) || HalfX(x, y) != 0;
             geom[t] = solid[t];
         }
     /* Absorb overhang: overhead art on walkable tiles touching a covered solid
@@ -1025,21 +1058,24 @@ void BuildMap(void) {
         int bestN = 0;
         for (int y = 0; y < H; ++y)
             for (int x = 0; x < W; ++x)
-                if (!Geom(x, y) && Cover(x, y) < 2 && SinkDepth(x, y) == 0.0f) {
+                if (!Geom(x, y) && Cover(x, y) == 0 && SinkDepth(x, y) == 0.0f) {
                     const int k = gMapBottom.mapData[y * 64 + x];
                     if (++freq[k] > bestN)
                         bestN = freq[k], groundX = x, groundY = y;
                 }
     }
+    /* Only uncovered ground: under overhead art (a canopy's edge) the ground
+     * layer is filler the 2D game never shows. Nearest first, south first. */
     auto groundFor = [&](int x, int y, int& ux, int& uy) -> bool {
         static const int kNb[4][2] = { { 0, 1 }, { -1, 0 }, { 1, 0 }, { 0, -1 } };
-        for (const auto& d : kNb) {
-            const int nx = x + d[0], ny = y + d[1];
-            if (inRoom(nx, ny) && !Geom(nx, ny) && Cover(nx, ny) < 2 && SinkDepth(nx, ny) == 0.0f) {
-                ux = nx, uy = ny;
-                return true;
+        for (int k = 1; k <= 3; ++k)
+            for (const auto& d : kNb) {
+                const int nx = x + d[0] * k, ny = y + d[1] * k;
+                if (inRoom(nx, ny) && !Geom(nx, ny) && Cover(nx, ny) == 0 && SinkDepth(nx, ny) == 0.0f) {
+                    ux = nx, uy = ny;
+                    return true;
+                }
             }
-        }
         ux = groundX, uy = groundY;
         return groundX >= 0;
     };
@@ -1059,16 +1095,23 @@ void BuildMap(void) {
     auto baseParams = [&](Uint32 mask, Uint32 fill) {
         return b8 | (mask << 8) | (fill ? 2u | ((fill - 1) << 20) : 0u);
     };
+    /* Box surfaces span this part of their tile's width (a half-solid tile's
+     * box stands on its solid half only), art clipped to match. */
+    float clipL = 0.0f, clipR = 16.0f;
     auto flatV = [&](int x, int y, float h, float z0, float z1, Uint32 mask, Uint32 fill = 0) {
-        const float x0 = x * 16.0f, x1 = x0 + 16;
+        const float x0 = x * 16.0f + clipL, x1 = x * 16.0f + clipR;
         const float c[4][3] = { { x0, h, z0 }, { x1, h, z0 }, { x0, h, z1 }, { x1, h, z1 } };
         Quad(sMapVerts, kMaxMapVerts, n, c, x0, y * 16.0f, x1, y * 16.0f + 16, 0, 0u, bChar, baseParams(mask, fill));
-        if (Cover(x, y))
-            flatL(true, x, x, y, h + 0.3f, z0, z1, mask);
+        if (Cover(x, y)) {
+            const float c2[4][3] = { { x0, h + 0.3f, z0 }, { x1, h + 0.3f, z0 }, { x0, h + 0.3f, z1 },
+                                     { x1, h + 0.3f, z1 } };
+            Quad(sMapVerts, kMaxMapVerts, n, c2, x0, y * 16.0f, x1, y * 16.0f + 16, 0, 128u, tChar,
+                 t8 | (mask << 8));
+        }
     };
     /* Tile (x,y) stood up on plane z = zFace, h0..h0+hh, composited the same. */
     auto wallV = [&](int x, int y, float zFace, float h0, float hh, Uint32 mask, Uint32 fill = 0) {
-        const float x0 = x * 16.0f, x1 = x0 + 16;
+        const float x0 = x * 16.0f + clipL, x1 = x * 16.0f + clipR;
         const float c[4][3] = { { x0, h0 + hh, zFace }, { x1, h0 + hh, zFace }, { x0, h0, zFace }, { x1, h0, zFace } };
         Quad(sMapVerts, kMaxMapVerts, n, c, x0, y * 16.0f, x1, y * 16.0f + 16, 0, 0u, bChar, baseParams(mask, fill));
         if (Cover(x, y)) {
@@ -1089,7 +1132,7 @@ void BuildMap(void) {
                      float xAt = -1.0f, int sx = -1, int sy = -1) {
         if (sx < 0)
             sx = x, sy = y;
-        const float xs = xAt >= 0.0f ? xAt : east ? x * 16.0f + 16 : x * 16.0f;
+        const float xs = xAt >= 0.0f ? xAt : east ? x * 16.0f + clipR : x * 16.0f + clipL;
         const float c[4][3] = { { xs, h, z0 }, { xs, h, z1 }, { xs, 0, z0 }, { xs, 0, z1 } };
         const float u0 = sx * 16.0f, v0 = sy * 16.0f;
         const bool top = Cover(sx, sy) != 0;
@@ -1657,8 +1700,8 @@ void BuildMap(void) {
                 rn.floating &= geom[r * 64 + x] == 2;
             for (int r = yt; r <= yb; ++r)
                 kind[r * 64 + x] = 2;
-            for (int b = rn.foot; b <= yb; ++b)
-                hmap[b * 64 + x] = rn.floating ? 0.0f : rn.topH; /* a floating canopy is no wall */
+            for (int b = rn.foot; b <= yb; ++b) /* a floating canopy is no wall; a half one leaves a gap */
+                hmap[b * 64 + x] = rn.floating || HalfX(x, b) ? 0.0f : rn.topH;
             runs.push_back(rn);
         }
     }
@@ -1755,15 +1798,27 @@ void BuildMap(void) {
             for (int tx = tr.x0; tx <= tr.x1; ++tx)
                 if (treeOf[ty * 64 + tx] == id && trunk[ty * 64 + tx])
                     tx0 = std::min(tx0, tx), tx1 = std::max(tx1, tx), trow = ty;
-        /* The crown covers the tree's whole collision footprint (its tile
-         * rows), as wide as its leaves, a rounded body on the trunk; its top
-         * is the 2D tree laid over that footprint. */
+        /* The crown stands over the tree's collision footprint (its solid
+         * tiles; the leaf rows behind those are overhang Link walks behind,
+         * so they are the crown's height, not its depth): a round body as
+         * wide as the leaves, its front at the footprint's front, raised on
+         * the trunk so Link fits under its back edge. */
         const float trunkZ = (trow >= 0 ? trow : tr.y1) * 16.0f + 8.0f;
-        const float Z0 = (float)Y0, Z1 = (float)Y1, zc = (Z0 + Z1) * 0.5f, rz = (Z1 - Z0) * 0.5f;
+        int cz0 = 64, cz1 = -1;
+        for (int ty = tr.y0; ty <= tr.y1; ++ty)
+            for (int tx = tr.x0; tx <= tr.x1; ++tx)
+                if (treeOf[ty * 64 + tx] == id && geom[ty * 64 + tx] == 1)
+                    cz0 = std::min(cz0, ty), cz1 = std::max(cz1, ty);
+        if (cz1 < 0)
+            cz0 = cz1 = trow >= 0 ? trow : tr.y1;
         const float xc = (lx0 + lx1 + 1) * 0.5f, rx = (lx1 - lx0 + 1) * 0.5f;
-        const float rh = std::clamp(std::min(rx, rz) * 0.8f, 12.0f, 36.0f);
-        const float h0 = 10.0f; /* crown's underside: over Link's head when he's beside it */
-        const float hc = h0 + rh;
+        const float mid = (ltop + lbot + 1) * 0.5f;
+        const float rz = std::clamp(std::max((cz1 - cz0 + 1) * 8.0f, rx * 0.85f), 8.0f, 40.0f);
+        const float rh = std::clamp(rx * 0.8f, 10.0f, 40.0f);
+        const float zc = (cz1 + 1) * 16.0f - rz, h0 = std::clamp(rx * 0.6f, 12.0f, 24.0f), hc = h0 + rh;
+        /* the crown's rows in the GBA's view (z - h), which the leaves' rows
+         * are stretched over for its colours */
+        const float pspan = std::sqrt(rz * rz + rh * rh), ptop = zc - hc - pspan, pbot = zc - hc + pspan;
         const int NX = (int)std::ceil(2 * rx / V) + 1, NZ = (int)std::ceil(2 * rz / V) + 1,
                   NH = (int)std::ceil(2 * rh / V) + 1;
         static Uint8 occ[128][64][64]; /* [x][h][z]: 0 empty, 1 crown, 2 trunk */
@@ -1782,32 +1837,30 @@ void BuildMap(void) {
         };
         /* face colour: the art pixel the voxel lands on in the GBA's view */
         auto face = [&](const float (&q)[4][3], float px, float ph, float pz) {
-            const int sx = (int)px;
+            int sx2 = (int)px;
+            const int sx = sx2;
             /* crown: the art row at this depth across the footprint (lower
              * faces toward the art's shaded bottom rows); trunk: the art the
              * GBA's view puts there */
             int sy = (int)(pz - ph);
-            if (ph > h0 - 1.0f) {
-                const float t = std::clamp((pz - Z0) / (Z1 - Z0), 0.0f, 1.0f);
-                const float low = std::clamp(1.0f - (ph - h0) / (2.0f * rh), 0.0f, 1.0f) * 0.35f;
-                sy = (int)(ltop + (t + low * (1.0f - t)) * (lbot - ltop));
-            }
-            /* crown voxels landing off the leaves (on a ledge behind) take the
-             * nearest leaf pixel in their column */
-            if (ph > h0 - 1.0f && !leaf(sx, sy))
-                for (int d = 1; d < 24; ++d) {
-                    if (leaf(sx, sy + d)) {
-                        sy += d;
-                        break;
-                    }
-                    if (leaf(sx, sy - d)) {
-                        sy -= d;
+            if (ph > h0 - 1.0f)
+                sy = (int)(ltop + (pz - ph - ptop) / (pbot - ptop) * (lbot - ltop));
+            /* crown voxels landing just off the leaves take the leaf pixel
+             * nearest them toward the crown's middle */
+            if (ph > h0 - 1.0f && !leaf(sx, sy)) {
+                const float dx = xc - sx, dy = mid - sy, len = std::max(1.0f, std::sqrt(dx * dx + dy * dy));
+                for (float d = 1.0f; d < len; d += 1.0f) {
+                    const int qx = (int)(sx + dx * d / len), qy = (int)(sy + dy * d / len);
+                    if (leaf(qx, qy)) {
+                        sx2 = qx, sy = qy;
                         break;
                     }
                 }
-            const int tx = sx >> 4, ty = sy >> 4;
-            const bool top = inRoom(tx, ty) && Cover(tx, ty) && TopIndex(tx, ty, sx & 15, sy & 15, tChar, t8 != 0) >= 0;
-            Quad(sMapVerts, kMaxMapVerts, n, q, sx + 0.5f, sy + 0.5f, sx + 0.5f, sy + 0.5f, 0, top ? 128u : 0u,
+            }
+            const int tx = sx2 >> 4, ty = sy >> 4;
+            const bool top =
+                inRoom(tx, ty) && Cover(tx, ty) && TopIndex(tx, ty, sx2 & 15, sy & 15, tChar, t8 != 0) >= 0;
+            Quad(sMapVerts, kMaxMapVerts, n, q, sx2 + 0.5f, sy + 0.5f, sx2 + 0.5f, sy + 0.5f, 0, top ? 128u : 0u,
                  top ? tChar : bChar, top ? t8 : b8);
         };
         auto emitBox = [&](float x0, float x1, float h0b, float h1b, float z0, float z1, bool nTop, bool nBot,
@@ -1902,6 +1955,12 @@ void BuildMap(void) {
         const int x = rn.x, yt = rn.yt, yb = rn.yb, face = rn.face;
         const float topH = rn.topH, zFace = (yb + 1) * 16.0f;
         const bool thin = yb - yt + 1 <= face; /* all face: 8px-deep cap */
+        /* a run of tiles all solid on the same half stands on that half */
+        int hx = HalfX(x, yt);
+        for (int r = yt; r <= yb && hx; ++r)
+            if (HalfX(x, r) != hx)
+                hx = 0;
+        clipL = hx == 2 ? 8.0f : 0.0f, clipR = hx == 1 ? 8.0f : 16.0f;
 
         Uint32 rowMask[64] = {};
         bool anyMask = false;
@@ -1913,7 +1972,7 @@ void BuildMap(void) {
         /* Ground where it can be seen: behind the footprint, and wherever
          * silhouettes are cut. */
         for (int r = yt; r <= yb; ++r) {
-            if (!anyMask && !rn.floating && r >= rn.foot)
+            if (!anyMask && !rn.floating && !hx && r >= rn.foot)
                 continue;
             if (r < rn.foot) {
                 /* Behind the footprint the 2D art has no ground (the object
@@ -1979,16 +2038,17 @@ void BuildMap(void) {
                     }
             };
             int sx;
-            if (hAt(x - 1, b) < topH && x > 0) {
+            if ((hx || hAt(x - 1, b) < topH) && x > 0) {
                 leafFrom(1, sx);
                 sideV(x, r, false, z0, z1, topH, (Uint32)fill, rowMask[r], -1.0f, sx, sx < 0 ? -1 : r);
             }
-            if (hAt(x + 1, b) < topH && x < W - 1) {
+            if ((hx || hAt(x + 1, b) < topH) && x < W - 1) {
                 leafFrom(-1, sx);
                 sideV(x, r, true, z0, z1, topH, (Uint32)fill, rowMask[r], -1.0f, sx, sx < 0 ? -1 : r);
             }
         }
     }
+    clipL = 0.0f, clipR = 16.0f;
     if (topBelow) {
         constexpr float kBelow = 64.0f;
         for (int y = 0; y < H; ++y)
