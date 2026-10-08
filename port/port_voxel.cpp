@@ -356,6 +356,9 @@ int sMapVertCount = 0;
 /* Ground height (px) of each room tile from the terrain solve in BuildMap:
  * raised areas, stairs; sprites stand on it. */
 float sTerrainH[64 * 64];
+/* Over a voxel roof: how far up (and south) what the 2D game draws on the
+ * roof's art stands (chimney smoke). */
+float sRoofH[64 * 64];
 int sTerrainW = 0, sTerrainHt = 0;
 Uint64 sMapKey = 0;
 constexpr int kMaskRows = 512; /* mask atlas: 256 x 512, 16 x 32 slots of 16 x 16 */
@@ -1026,6 +1029,7 @@ void BuildMap(void) {
     sBuildShapes = CurrentShapes();
     const int wallTiles = sBuildShapes ? sBuildShapes->wall : kDefaultWallTiles;
     sPropCount = 0;
+    std::memset(sRoofH, 0, sizeof(sRoofH));
     std::memset(sMaskPixels, 0, sizeof(sMaskPixels));
     std::memset(sPropCutout, 0, sizeof(sPropCutout));
     const int W = gRoomControls.width / 16, H = gRoomControls.height / 16;
@@ -2619,6 +2623,17 @@ void BuildMap(void) {
             for (int x = 0; x < W; ++x)
                 if (loose(x, y))
                     terr[y * 64 + x] = std::round(terr[y * 64 + x] * 0.5f) * 2.0f;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x)
+                if (act(x, y) == 0x74 && loose(x, y)) {
+                    float h = -1e9f;
+                    static const int d[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+                    for (const auto& k : d)
+                        if (inRoom(x + k[0], y + k[1]) && region[(y + k[1]) * 64 + x + k[0]] >= 0)
+                            h = std::max(h, terr[(y + k[1]) * 64 + x + k[0]]);
+                    if (h > -1e8f)
+                        terr[y * 64 + x] = h;
+                }
         (void)hf;
         /* cliff-tagged floor tiles: their higher neighbour's height */
         for (int y = 0; y < H; ++y)
@@ -3110,6 +3125,17 @@ void BuildMap(void) {
                  * edges) or floats above it (arches), placed by projection. */
                 const float d = SinkDepth(x, y);
                 flatL(false, x, x, y, d, y * 16.0f, y * 16.0f + 16, 0);
+                /* a bridge: the river runs on under it at its own level */
+                if (outdoors && d == 0.0f)
+                    for (int dy : { 1, -1, 2, -2, 3, -3 }) {
+                        const int wy = y + dy;
+                        if (!inRoom(x, wy) || kind[wy * 64 + x] != 0 || SinkDepth(x, wy) >= 0.0f)
+                            continue;
+                        const float rel = terr[wy * 64 + x] - terr[t];
+                        if (rel < -4.0f)
+                            flatL(false, x, x, wy, rel + SinkDepth(x, wy), y * 16.0f + rel, y * 16.0f + 16 + rel, 0);
+                        break;
+                    }
                 if (d < 0.0f) {
                     static const int kEdge[4][2] = { { 0, -1 }, { 0, 1 }, { -1, 0 }, { 1, 0 } };
                     for (int e = 0; e < 4; ++e) {
@@ -3151,7 +3177,7 @@ void BuildMap(void) {
                     continue;
                 /* down to a box: to its top (a cliff top lower than this ground) */
                 const int nt = ny * 64 + nx;
-                if (stairTile(nt))
+                if (stairTile(nt) || (kind[nt] == 0 && SinkDepth(nx, ny) < 0.0f))
                     continue;
                 const float lo = kind[nt] == 2 ? std::max(hmap[nt], terr[nt]) : terr[nt], hi = terr[t];
                 if (hi - lo < 1.0f)
@@ -3556,6 +3582,14 @@ void BuildMap(void) {
                     }
                 };
                 const int artTop = gTop * 16, artBot = (gBot + 1) * 16 - 1;
+                /* each art row's spot on the roof: z with z - h(z) = row */
+                for (int r = gTop; r <= gBot; ++r) {
+                    const float row = r * 16.0f + 8.0f;
+                    float z = row;
+                    for (int it = 0; it < 24; ++it)
+                        z = std::clamp(row + prof(z), zc, zF);
+                    sRoofH[r * 64 + x] = std::max(0.0f, prof(z) - 1.0f);
+                }
                 auto artRowAt = [&](float z, float h) { return std::clamp((int)(z - h), artTop, artBot); };
                 /* front wall: the stone band stood up */
                 for (int k = 0; k < (int)hw; ++k) {
@@ -3626,9 +3660,10 @@ void BuildMap(void) {
                                 bool tp;
                                 const int v = visible(cx * 16 + c, artRowAt(zF, k + 0.5f), tp);
                                 const int r = v & 31, g = (v >> 5) & 31, b = (v >> 10) & 31;
-                                bad += v >= 0 && g > r + 3 && g > b + 3;
+                                const int mx = std::max(r, std::max(g, b)), mn = std::min(r, std::min(g, b));
+                                bad += v >= 0 && (mx - mn > 6 || mx < 7); /* not grey stone: the door, its frame */
                             }
-                        return bad < 3;
+                        return bad * 4 < (int)hw * 8;
                     };
                     int sx = x;
                     for (int d = 1; d < 8 && !plainBand(sx); ++d) {
@@ -4206,8 +4241,11 @@ static bool PresentImpl(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swap, int swa
         { /* the terrain under the entity's feet: up, and south like the ground */
             const int tx = (int)std::floor((tag.anchorX + scrollX) / 16.0f),
                       ty = (int)std::floor((tag.groundY + scrollY - 1.0f) / 16.0f);
-            if (tx >= 0 && ty >= 0 && tx < sTerrainW && ty < sTerrainHt)
+            if (tx >= 0 && ty >= 0 && tx < sTerrainW && ty < sTerrainHt) {
                 groundShift = sTerrainH[ty * 64 + tx];
+                if (!tag.player) /* drawn on a roof's art: on the roof */
+                    groundShift += sRoofH[ty * 64 + tx];
+            }
             elev += groundShift;
         }
         float c[4][3];
