@@ -1652,19 +1652,19 @@ void BuildMap(void) {
                         rTop = std::min(rTop, r), rBot = std::max(rBot, r);
             if (rBot < 0)
                 return;
-            const float trunkRad = std::clamp(runW[nr / 2] * 0.5f, 0.75f, 2.5f);
+            const float trunkRad = std::clamp(runW[nr / 2] * 0.5f, 1.75f, 2.75f); /* the art's thick trunk */
             const int rootRows = std::max(2, (rBot - rTop + 1) / 3);
-            auto put = [&](float fx, float fh, float fz, int c, int r) { /* 1-px blob at (fx, fh, fz) in px */
-                for (int dx = 0; dx < 2; ++dx)
-                    for (int dz = 0; dz < 2; ++dz)
+            /* a blob `w` half-cells wide, `t` deep, at (fx, fh, fz) in px */
+            auto put = [&](float fx, float fh, float fz, int c, int r, int w = 2, int t = 2) {
+                for (int dx = 0; dx < w; ++dx)
+                    for (int dz = 0; dz < t; ++dz)
                         for (int dh = 0; dh < 2; ++dh) {
-                            const int vx = (int)std::floor(fx * 2) + dx - 1 + 1, vz = (int)std::floor(fz * 2) + dz - 1 + 1,
-                                      vh = (int)std::floor(fh * 2) + dh;
+                            const int vx = (int)std::floor(fx * 2) + dx - w / 2 + 1,
+                                      vz = (int)std::floor(fz * 2) + dz - t / 2 + 1, vh = (int)std::floor(fh * 2) + dh;
                             if (vx >= 0 && vx < S && vz >= 0 && vz < S && vh >= 0 && vh < S && src[vh][vx][vz] < 0)
                                 src[vh][vx][vz] = (Sint16)(r * 16 + c);
                         }
             };
-            static const float kRootAng[5] = { 0.3f, 1.55f, 2.8f, 4.0f, 5.2f };
             for (int r = rTop; r <= rBot; ++r) {
                 const float h = (float)(rBot - r); /* px above the ground */
                 int l = -1, rr = -1;
@@ -1701,15 +1701,19 @@ void BuildMap(void) {
                     if (!on(c, r) || (l >= 0 && std::fabs(c + 0.5f - tc) <= trunkRad + 0.5f))
                         continue;
                     const float dx = c + 0.5f - tc;
-                    if (rootRow) { /* a root: out along the ground in five directions */
-                        const float out = std::fabs(dx);
-                        for (int a = 0; a < 5; ++a) {
-                            const float ang = kRootAng[a] + (dx < 0 ? 0.6f : 0.0f);
-                            put(tc + std::cos(ang) * out, h, 8.0f + std::sin(ang) * out, c, r);
-                        }
-                    } else { /* a sprig: two crossed planes through the trunk */
-                        put(tc + dx, h, 8.0f, c, r);
-                        put(tc, h, 8.0f + dx, c, r);
+                    if (rootRow) {
+                        /* roots: the art's left and right roots reach out front
+                         * left and front right, the longer ones also back; thick
+                         * by the trunk, tapering */
+                        const float out = std::fabs(dx), sgn = dx < 0 ? -1.0f : 1.0f;
+                        const int w = out < trunkRad + 2.0f ? 3 : 2;
+                        put(tc + sgn * out * 0.85f, h, 8.0f + out * 0.5f, c, r, w, w);
+                        if (out > trunkRad + 1.5f)
+                            put(tc + sgn * out * 0.3f, h, 8.0f - out * 0.8f, c, r, 2, 2);
+                    } else {
+                        /* leaves: the left and right clusters as the art has
+                         * them, a leaf 2 px thick */
+                        put(tc + dx, h, 8.0f, c, r, 2, 4);
                     }
                 }
             }
