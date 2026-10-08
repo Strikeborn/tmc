@@ -2236,10 +2236,73 @@ void BuildMap(void) {
     for (int t = 0; t < 64 * 64; ++t)
         if (treeOf[t])
             kind[t] = 4;
+    /* Shrubs: a small clump of leafy solid tiles (a town's 2x2 flower
+     * shrubs, two stacked), 2-16 tiles in at most 4x4, standing alone:
+     * built from their art together (kind 5), one round body per outlined
+     * shrub in it, not boxes. */
+    struct Shrub {
+        int x0, y0, x1, y1;
+    };
+    std::vector<Shrub> shrubs;
+    if (outdoors) {
+        auto leafyTile = [&](int x, int y) {
+            if (!inRoom(x, y) || geom[y * 64 + x] != 1 || treeOf[y * 64 + x] || Cover(x, y) || CliffTile(x, y))
+                return false;
+            int g = 0, all = 0;
+            for (int i = 0; i < 256; i += 2) {
+                const int c = BottomPixel(x, y, i & 15, i >> 4, bChar, b8 != 0);
+                if (c < 0)
+                    continue;
+                ++all;
+                const int r = c & 31, gg = (c >> 5) & 31, b = (c >> 10) & 31;
+                g += (gg > r && gg > b) || (r > 22 && gg > 22 && b > 22); /* leaves, white flowers */
+            }
+            return all > 0 && g * 10 >= all * 6;
+        };
+        static Uint8 seen[64 * 64];
+        std::memset(seen, 0, sizeof(seen));
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                if (seen[y * 64 + x] || !leafyTile(x, y))
+                    continue;
+                int stack[16], sp = 0, n2 = 0, members[16];
+                Shrub g = { x, y, x, y };
+                bool big = false;
+                stack[sp++] = y * 64 + x;
+                seen[y * 64 + x] = 1;
+                while (sp) {
+                    const int t = stack[--sp], tx = t % 64, ty = t / 64;
+                    if (n2 < 16)
+                        members[n2] = t;
+                    ++n2;
+                    g.x0 = std::min(g.x0, tx), g.x1 = std::max(g.x1, tx), g.y0 = std::min(g.y0, ty), g.y1 = std::max(g.y1, ty);
+                    static const int d[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+                    for (const auto& k : d) {
+                        const int nx = tx + k[0], ny = ty + k[1];
+                        if (!inRoom(nx, ny) || seen[ny * 64 + nx])
+                            continue;
+                        if (leafyTile(nx, ny)) {
+                            seen[ny * 64 + nx] = 1;
+                            if (sp < 16)
+                                stack[sp++] = ny * 64 + nx;
+                            else
+                                big = true;
+                        } else if (geom[ny * 64 + nx] == 1 && !treeOf[ny * 64 + nx]) {
+                            big = true; /* joined to a wall or another solid: not a lone shrub */
+                        }
+                    }
+                }
+                if (big || n2 < 2 || n2 > 16 || g.x1 - g.x0 > 3 || g.y1 - g.y0 > 3)
+                    continue;
+                shrubs.push_back(g);
+                for (int i = 0; i < n2 && i < 16; ++i)
+                    kind[members[i]] = 5;
+            }
+    }
     for (int x = 0; x < W; ++x) {
         int y = H - 1;
         while (y >= 0) {
-            if (!Geom(x, y) || kind[y * 64 + x] == 1 || kind[y * 64 + x] == 4) { /* 1: a prop on top of a run, 4: a tree */
+            if (!Geom(x, y) || kind[y * 64 + x] == 1 || kind[y * 64 + x] == 4 || kind[y * 64 + x] == 5) { /* 1: a prop on top of a run, 4: a tree, 5: a shrub */
                 --y;
                 continue;
             }
@@ -2255,7 +2318,7 @@ void BuildMap(void) {
              * top of the run (a sapling planted against a tree's trunk) may be
              * its own prop: the run ends below it (the scan skips it next).
              * Only on top of trees: walls change type row to row too. */
-            while (y >= 0 && Geom(x, y) && !inTree(x, y)) {
+            while (y >= 0 && Geom(x, y) && !inTree(x, y) && kind[y * 64 + x] != 5) {
                 const bool newType = BottomTileType(y * 64 + x) != BottomTileType((y + 1) * 64 + x) && outdoors;
                 if (newType && (((Cover(x, y + 1) || Foliage(x, y + 1)) && isProp(x, y)) ||
                                 /* a fence standing on a cliff's top */
@@ -2336,7 +2399,7 @@ void BuildMap(void) {
             const int t = y * 64 + x;
             if (slopeV(x, y) || slopeH(x, y) || act(x, y) == 0x74 || CliffTile(x, y))
                 return false;
-            return !Geom(x, y) || kind[t] == 1 || kind[t] == 4;
+            return !Geom(x, y) || kind[t] == 1 || kind[t] == 4 || kind[t] == 5;
         };
         for (int t = 0; t < 64 * 64; ++t)
             region[t] = -1, terr[t] = 0.0f;
@@ -2425,7 +2488,7 @@ void BuildMap(void) {
             if (!inRoom(x, y) || CliffTile(x, y))
                 return false;
             const int t = y * 64 + x;
-            return !Geom(x, y) || kind[t] == 1 || kind[t] == 4;
+            return !Geom(x, y) || kind[t] == 1 || kind[t] == 4 || kind[t] == 5;
         };
         struct Link2 {
             int a, b, dh, n;
@@ -2906,8 +2969,8 @@ void BuildMap(void) {
             if (kind[t] == 1) {
                 underlay(x, y);
                 voxelProp(x, y, propSlot[t]);
-            } else if (kind[t] == 4) {
-                underlay(x, y); /* the voxel tree stands over borrowed ground */
+            } else if (kind[t] == 4 || kind[t] == 5) {
+                underlay(x, y); /* the voxel tree or shrub stands over borrowed ground */
             } else if (kind[t] == 3) {
                 underlay(x, y);
                 flatV(x, y, 0.2f, y * 16.0f, y * 16.0f + 16, 0);
@@ -2966,6 +3029,204 @@ void BuildMap(void) {
                 Quad(sMapVerts, kMaxMapVerts, n, c, x0, z0, x1, z1, 0, 0u, bChar, b8);
             }
         }
+    /* shrubs: their art's outline (traced across their tiles together) as
+     * one rounded dome of 1-px voxels, the art laid over it from above, the
+     * sides wearing the nearest leaf that isn't outline */
+    for (const Shrub& sh : shrubs) {
+        const int n0 = n;
+        const int PW = (sh.x1 - sh.x0 + 1) * 16, PH = (sh.y1 - sh.y0 + 1) * 16;
+        auto px = [&](int c, int r) {
+            return c < 0 || r < 0 || c >= PW || r >= PH ? -1
+                                                         : BottomPixel(sh.x0 + (c >> 4), sh.y0 + (r >> 4), c & 15, r & 15,
+                                                                       bChar, b8 != 0);
+        };
+        auto brownish = [](int c) { return c >= 0 && (c & 31) > ((c >> 5) & 31) + 2; };
+        static bool outside[64][64];
+        static int st[64 * 64];
+        for (int r = 0; r < PH; ++r)
+            for (int c = 0; c < PW; ++c)
+                outside[r][c] = false;
+        /* the ground round it: every colour of the walkable tiles within two */
+        int gcol[256], ngc = 0;
+        for (int gy = sh.y0 - 2; gy <= sh.y1 + 2; ++gy)
+            for (int gx = sh.x0 - 2; gx <= sh.x1 + 2; ++gx) {
+                if (!inRoom(gx, gy) || Geom(gx, gy) || Cover(gx, gy))
+                    continue;
+                for (int i = 0; i < 256 && ngc < 256; ++i) {
+                    const int c = BottomPixel(gx, gy, i & 15, i >> 4, bChar, b8 != 0);
+                    if (std::find(gcol, gcol + ngc, c) == gcol + ngc)
+                        gcol[ngc++] = c;
+                }
+            }
+        int sp = 0;
+        auto push = [&](int c, int r) {
+            if (c < 0 || r < 0 || c >= PW || r >= PH || outside[r][c])
+                return;
+            const int v = px(c, r);
+            /* the flood runs through ground only: the shrub's outline (any
+             * colour that isn't the ground's) stops it */
+            if (v >= 0 && std::find(gcol, gcol + ngc, v) == gcol + ngc)
+                return;
+            outside[r][c] = true;
+            st[sp++] = r * 64 + c;
+        };
+        for (int c = 0; c < PW; ++c)
+            push(c, 0), push(c, PH - 1);
+        for (int r = 0; r < PH; ++r)
+            push(0, r), push(PW - 1, r);
+        while (sp) {
+            const int i = st[--sp], c = i % 64, r = i / 64;
+            push(c + 1, r), push(c - 1, r), push(c, r + 1), push(c, r - 1);
+        }
+        auto body = [&](int c, int r) {
+            if (c < 0 || r < 0 || c >= PW || r >= PH || outside[r][c])
+                return false;
+            const int v = px(c, r);
+            if (v < 0 || brownish(v))
+                return false;
+            if (!Dark555(v))
+                return true;
+            /* outline: only where it touches the body inside (not a shadow mass) */
+            for (int k = 0; k < 4; ++k) {
+                static const int d[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+                const int nc = c + d[k][0], nr = r + d[k][1];
+                if (nc >= 0 && nr >= 0 && nc < PW && nr < PH && !outside[nr][nc] && px(nc, nr) >= 0 &&
+                    !Dark555(px(nc, nr)))
+                    return true;
+            }
+            return false;
+        };
+        constexpr int NH2 = 32;
+        static Uint8 occ2[64][NH2][64];
+        std::memset(occ2, 0, sizeof(occ2));
+        /* each outlined shrub (a connected patch of body pixels) its own dome */
+        static Sint16 comp[64][64];
+        for (int r = 0; r < PH; ++r)
+            for (int c = 0; c < PW; ++c)
+                comp[r][c] = -1;
+        int ncomp = 0;
+        static int cst[64 * 64];
+        for (int r = 0; r < PH; ++r)
+            for (int c = 0; c < PW; ++c) {
+                if (comp[r][c] >= 0 || !body(c, r))
+                    continue;
+                int csp = 0, c0 = c, c1 = c, r0 = r, r1 = r, cnt = 0;
+                comp[r][c] = (Sint16)ncomp;
+                cst[csp++] = r * 64 + c;
+                while (csp) {
+                    const int i = cst[--csp], cc = i % 64, rr = i / 64;
+                    ++cnt;
+                    c0 = std::min(c0, cc), c1 = std::max(c1, cc), r0 = std::min(r0, rr), r1 = std::max(r1, rr);
+                    static const int d[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+                    for (const auto& k : d) {
+                        const int nc = cc + k[0], nr = rr + k[1];
+                        if (nc >= 0 && nr >= 0 && nc < PW && nr < PH && comp[nr][nc] < 0 && body(nc, nr)) {
+                            comp[nr][nc] = (Sint16)ncomp;
+                            cst[csp++] = nr * 64 + nc;
+                        }
+                    }
+                }
+                ++ncomp;
+                if (cnt < 40)
+                    continue;
+                /* shrubs drawn touching (two stacked) share an outline: a patch
+                 * two or more times longer than wide is that many round ones */
+                const int pw = c1 - c0 + 1, ph = r1 - r0 + 1;
+                const int split = std::max(1, (int)std::lround((float)std::max(pw, ph) / std::min(pw, ph)));
+                for (int k = 0; k < split; ++k) {
+                const int sc0 = pw >= ph ? c0 + pw * k / split : c0, sc1 = pw >= ph ? c0 + pw * (k + 1) / split - 1 : c1;
+                const int sr0 = pw >= ph ? r0 : r0 + ph * k / split, sr1 = pw >= ph ? r1 : r0 + ph * (k + 1) / split - 1;
+                const float dcx = (sc0 + sc1 + 1) * 0.5f, dcz = (sr0 + sr1 + 1) * 0.5f;
+                const float drx = (sc1 - sc0 + 1) * 0.5f + 0.5f, drz = (sr1 - sr0 + 1) * 0.5f + 0.5f;
+                const float domeH = std::clamp(std::min(drx, drz) * 0.95f, 8.0f, 22.0f); /* a round shrub, not a box */
+                for (int vx = std::max(0, sc0 - 1); vx <= std::min(PW - 1, sc1 + 1); ++vx)
+                    for (int vz = std::max(0, sr0 - 1); vz <= std::min(PH - 1, sr1 + 1); ++vz) {
+                        const float ex = (vx + 0.5f - dcx) / drx, ez = (vz + 0.5f - dcz) / drz;
+                        const float e = ex * ex + ez * ez;
+                        if (e >= 1.0f)
+                            continue;
+                        const int v = px(vx, vz);
+                        const float lum = v >= 0 ? ((v >> 5) & 31) / 31.0f : 0.5f;
+                        const float hTop = domeH * std::sqrt(1.0f - e) * (0.9f + 0.1f * lum);
+                        for (int vh = 0; vh < std::min(NH2, (int)std::lround(hTop)); ++vh)
+                            occ2[vx][vh][vz] = 1;
+                    }
+                }
+            }
+        if (std::getenv("TMC_VOXEL_DUMPMAP")) {
+            int bodyN = 0, outN = 0;
+            for (int r = 0; r < PH; ++r)
+                for (int c = 0; c < PW; ++c)
+                    bodyN += body(c, r), outN += outside[r][c];
+            std::fprintf(stderr, "[voxel-shrub] %d,%d..%d,%d body %d outside %d of %d, %d patches\n", sh.x0, sh.y0,
+                         sh.x1, sh.y1, bodyN, outN, PW * PH, ncomp);
+        }
+        if (ncomp == 0)
+            continue;
+        auto nearest = [&](int c, int r, bool light, int& oc, int& orr) {
+            oc = -1;
+            for (int d = 0; d < 12 && oc < 0; ++d)
+                for (int dr = -d; dr <= d && oc < 0; ++dr)
+                    for (int dc = -d; dc <= d; ++dc)
+                        if (std::max(std::abs(dr), std::abs(dc)) == d && body(c + dc, r + dr) &&
+                            (!light || !Dark555(px(c + dc, r + dr)))) {
+                            oc = c + dc, orr = r + dr;
+                            break;
+                        }
+        };
+        auto filled = [&](int vx, int vh, int vz) {
+            return vx >= 0 && vx < PW && vz >= 0 && vz < PH && vh >= 0 && vh < NH2 && occ2[vx][vh][vz];
+        };
+        const Uint32 params = baseParams(0, 0);
+        for (int vx = 0; vx < PW; ++vx)
+            for (int vz = 0; vz < PH; ++vz) {
+                if (!occ2[vx][0][vz])
+                    continue;
+                int tc, tr, sc, sr;
+                nearest(vx, vz, false, tc, tr);
+                nearest(vx, vz, true, sc, sr);
+                if (tc < 0)
+                    continue;
+                if (sc < 0)
+                    sc = tc, sr = tr;
+                const float ut = sh.x0 * 16.0f + tc + 0.5f, vt = sh.y0 * 16.0f + tr + 0.5f;
+                const float us = sh.x0 * 16.0f + sc + 0.5f, vs = sh.y0 * 16.0f + sr + 0.5f;
+                const float px0 = sh.x0 * 16.0f + vx, pz0 = sh.y0 * 16.0f + vz, px1 = px0 + 1, pz1 = pz0 + 1;
+                auto face = [&](const float (&q)[4][3], bool top) {
+                    Quad(sMapVerts, kMaxMapVerts, n, q, top ? ut : us, top ? vt : vs, top ? ut : us, top ? vt : vs, 0, 0u,
+                         bChar, params);
+                };
+                for (int vh = 0; vh < NH2; ++vh) {
+                    if (!occ2[vx][vh][vz])
+                        continue;
+                    const float bot = (float)vh, top = bot + 1;
+                    if (!filled(vx, vh + 1, vz)) {
+                        const float q[4][3] = { { px0, top, pz0 }, { px1, top, pz0 }, { px0, top, pz1 }, { px1, top, pz1 } };
+                        face(q, true);
+                    }
+                    if (!filled(vx, vh, vz + 1)) {
+                        const float q[4][3] = { { px0, top, pz1 }, { px1, top, pz1 }, { px0, bot, pz1 }, { px1, bot, pz1 } };
+                        face(q, false);
+                    }
+                    if (!filled(vx, vh, vz - 1)) {
+                        const float q[4][3] = { { px1, top, pz0 }, { px0, top, pz0 }, { px1, bot, pz0 }, { px0, bot, pz0 } };
+                        face(q, false);
+                    }
+                    if (!filled(vx - 1, vh, vz)) {
+                        const float q[4][3] = { { px0, top, pz0 }, { px0, top, pz1 }, { px0, bot, pz0 }, { px0, bot, pz1 } };
+                        face(q, false);
+                    }
+                    if (!filled(vx + 1, vh, vz)) {
+                        const float q[4][3] = { { px1, top, pz1 }, { px1, top, pz0 }, { px1, bot, pz1 }, { px1, bot, pz0 } };
+                        face(q, false);
+                    }
+                }
+            }
+        float h = 0.0f;
+        for (int x = sh.x0; x <= sh.x1; ++x)
+            h = std::max(h, terr[sh.y1 * 64 + x]);
+        liftFrom(n0, h);
+    }
     for (size_t i = 0; i < trees.size(); ++i) {
         const int n0 = n;
         treeVoxels(trees[i], (int)i + 1);
