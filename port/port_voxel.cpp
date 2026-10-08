@@ -1547,8 +1547,12 @@ void BuildMap(void) {
                 constexpr int NH = 20;
                 static Uint8 occ[16][NH][16]; /* [x][h][z] */
                 std::memset(occ, 0, sizeof(occ));
-                /* one round shrub: a dome over the body's extent, a little
-                 * higher where the art is lit (the leaves' bumps) */
+                /* One round bush in half-pixel voxels. The art is the GBA's
+                 * angled view: as deep as it is wide, standing on the art's
+                 * bottom, the rows above that its height. Each voxel wears the
+                 * art pixel the GBA's view puts it on (its row z - h stretched
+                 * over the art's rows), so the top shows the upper rows (lit
+                 * leaves) and the front the lower, shaded ones. */
                 int c0 = 16, c1 = -1, r0 = 16, r1 = -1;
                 for (int r = 0; r < 16; ++r)
                     for (int c = 0; c < 16; ++c)
@@ -1556,93 +1560,78 @@ void BuildMap(void) {
                             c0 = std::min(c0, c), c1 = std::max(c1, c), r0 = std::min(r0, r), r1 = std::max(r1, r);
                 if (c1 < 0)
                     return;
-                const float dcx = (c0 + c1 + 1) * 0.5f, dcz = (r0 + r1 + 1) * 0.5f;
-                const float drx = (c1 - c0 + 1) * 0.5f + 0.5f, drz = (r1 - r0 + 1) * 0.5f + 0.5f;
-                const float domeH = std::clamp(std::min(drx, drz) * 1.35f, 7.0f, 12.0f);
-                for (int vx = 0; vx < 16; ++vx)
-                    for (int vz = 0; vz < 16; ++vz) {
-                        const float ex = (vx + 0.5f - dcx) / drx, ez = (vz + 0.5f - dcz) / drz;
-                        const float e = std::pow(std::fabs(ex), 2.4f) + std::pow(std::fabs(ez), 2.4f);
+                constexpr int S2 = 32, SH = 28; /* 0.5-px cells */
+                static Uint8 occ2b[S2][SH][S2];
+                std::memset(occ2b, 0, sizeof(occ2b));
+                const float rx = (c1 - c0 + 1) * 0.5f, rz = std::min(rx * 0.8f, (r1 - r0 + 1) * 0.5f);
+                const float dcx = c0 + rx, dcz = r1 + 1 - rz;
+                const float domeH = std::clamp(rx * 1.15f, 6.0f, 13.5f); /* a round bush, not a cushion */
+                for (int vx = 0; vx < S2; ++vx)
+                    for (int vz = 0; vz < S2; ++vz) {
+                        const float fx = (vx + 0.5f) * 0.5f, fz = (vz + 0.5f) * 0.5f;
+                        const float ex = (fx - dcx) / rx, ez = (fz - dcz) / rz, e = ex * ex + ez * ez;
                         if (e >= 1.0f)
                             continue;
-                        const int pc = std::clamp(vx, 0, 15), pr = std::clamp(vz, 0, 15);
-                        const int p = pix(pc, pr);
-                        const float lum = p >= 0 ? ((p >> 5) & 31) / 31.0f : 0.5f;
-                        const float hTop = domeH * std::pow(1.0f - e, 1.0f / 2.4f) * (0.88f + 0.12f * lum);
-                        for (int vh = 0; vh < std::min(NH, (int)std::lround(hTop)); ++vh)
-                            occ[vx][vh][vz] = 1;
+                        const float hTop = domeH * std::sqrt(1.0f - e);
+                        for (int vh = 0; vh < std::min(SH, (int)std::lround(hTop * 2.0f)); ++vh)
+                            occ2b[vx][vh][vz] = 1;
                     }
-
-                /* colour source per column: the leaf pixel there, else the nearest */
-                /* (tops wear the art as drawn, creases and all; sides the
-                 * nearest leaf that isn't outline-black) */
-                int srcCol[16][16], srcRow[16][16], sideCol[16][16], sideRow[16][16];
-                auto nearest = [&](int c, int r, bool light, int& oc, int& orr) {
+                /* the GBA view's rows over the dome: z - h from its crown's
+                 * back to its front foot */
+                const float pTop = dcz - std::sqrt(rz * rz + domeH * domeH), pBot = dcz + rz;
+                auto artAt = [&](float fx, float fh, float fz, int& oc, int& orr) {
+                    const float t = std::clamp((fz - fh - pTop) / (pBot - pTop), 0.0f, 0.999f);
+                    int c = std::clamp((int)fx, 0, 15), r = std::clamp(r0 + (int)(t * (r1 - r0 + 1)), 0, 15);
                     oc = -1;
                     for (int d = 0; d < 8 && oc < 0; ++d)
                         for (int dr = -d; dr <= d && oc < 0; ++dr)
                             for (int dc = -d; dc <= d; ++dc)
-                                if (std::max(std::abs(dr), std::abs(dc)) == d && part(c + dc, r + dr) &&
-                                    (!light || !Dark555(pix(c + dc, r + dr)))) {
+                                if (std::max(std::abs(dr), std::abs(dc)) == d && part(c + dc, r + dr)) {
                                     oc = c + dc, orr = r + dr;
                                     break;
                                 }
                 };
-                for (int r = 0; r < 16; ++r)
-                    for (int c = 0; c < 16; ++c) {
-                        nearest(c, r, false, srcCol[r][c], srcRow[r][c]);
-                        nearest(c, r, true, sideCol[r][c], sideRow[r][c]);
-                        if (sideCol[r][c] < 0)
-                            sideCol[r][c] = srcCol[r][c], sideRow[r][c] = srcRow[r][c];
-                    }
                 auto filled = [&](int vx, int vh, int vz) {
-                    return vx >= 0 && vx < 16 && vz >= 0 && vz < 16 && vh >= 0 && vh < NH && occ[vx][vh][vz];
+                    return vx >= 0 && vx < S2 && vz >= 0 && vz < S2 && vh >= 0 && vh < SH && occ2b[vx][vh][vz];
                 };
                 const Uint32 params = baseParams(0, 0);
-                for (int vx = 0; vx < 16; ++vx)
-                    for (int vz = 0; vz < 16; ++vz) {
-                        if (srcCol[vz][vx] < 0)
-                            continue;
-                        const float u = x * 16.0f + srcCol[vz][vx] + 0.5f, v = y * 16.0f + srcRow[vz][vx] + 0.5f;
-                        const float us = x * 16.0f + sideCol[vz][vx] + 0.5f, vs = y * 16.0f + sideRow[vz][vx] + 0.5f;
-                        bool topFace = false;
-                        auto face = [&](const float (&q)[4][3]) {
-                            Quad(sMapVerts, kMaxMapVerts, n, q, topFace ? u : us, topFace ? v : vs, topFace ? u : us,
-                                 topFace ? v : vs, 0, 0u, bChar, params);
-                        };
-                        const float px = x * 16.0f + vx, pz = y * 16.0f + vz, px1 = px + 1, pz1 = pz + 1;
-                        for (int vh = 0; vh < NH; ++vh) {
-                            if (!occ[vx][vh][vz])
+                for (int vx = 0; vx < S2; ++vx)
+                    for (int vz = 0; vz < S2; ++vz)
+                        for (int vh = 0; vh < SH; ++vh) {
+                            if (!occ2b[vx][vh][vz])
                                 continue;
-                            const float bot = (float)vh, top = bot + 1;
+                            const float px = x * 16.0f + vx * 0.5f, pz = y * 16.0f + vz * 0.5f, px1 = px + 0.5f,
+                                        pz1 = pz + 0.5f, bot = vh * 0.5f, top = bot + 0.5f;
+                            auto face = [&](const float (&q)[4][3], float fx, float fh, float fz) {
+                                int oc, orr;
+                                artAt(fx, fh, fz, oc, orr);
+                                if (oc < 0)
+                                    return;
+                                const float u = x * 16.0f + oc + 0.5f, v = y * 16.0f + orr + 0.5f;
+                                Quad(sMapVerts, kMaxMapVerts, n, q, u, v, u, v, 0, 0u, bChar, params);
+                            };
+                            const float fx = (vx + 0.5f) * 0.5f, fz = (vz + 0.5f) * 0.5f, fh = (vh + 0.5f) * 0.5f;
                             if (!filled(vx, vh + 1, vz)) {
                                 const float q[4][3] = { { px, top, pz }, { px1, top, pz }, { px, top, pz1 }, { px1, top, pz1 } };
-                                topFace = true;
-                                face(q);
-                                topFace = false;
-                            }
-                            if (vh > 0 && !filled(vx, vh - 1, vz)) {
-                                const float q[4][3] = { { px, bot, pz1 }, { px1, bot, pz1 }, { px, bot, pz }, { px1, bot, pz } };
-                                face(q);
+                                face(q, fx, top, fz);
                             }
                             if (!filled(vx, vh, vz + 1)) {
                                 const float q[4][3] = { { px, top, pz1 }, { px1, top, pz1 }, { px, bot, pz1 }, { px1, bot, pz1 } };
-                                face(q);
+                                face(q, fx, fh, pz1 - y * 16.0f);
                             }
                             if (!filled(vx, vh, vz - 1)) {
                                 const float q[4][3] = { { px1, top, pz }, { px, top, pz }, { px1, bot, pz }, { px, bot, pz } };
-                                face(q);
+                                face(q, fx, fh, fz);
                             }
                             if (!filled(vx - 1, vh, vz)) {
                                 const float q[4][3] = { { px, top, pz }, { px, top, pz1 }, { px, bot, pz }, { px, bot, pz1 } };
-                                face(q);
+                                face(q, fx, fh, fz);
                             }
                             if (!filled(vx + 1, vh, vz)) {
                                 const float q[4][3] = { { px1, top, pz1 }, { px1, top, pz }, { px1, bot, pz1 }, { px1, bot, pz } };
-                                face(q);
+                                face(q, fx, fh, fz);
                             }
                         }
-                    }
                 return;
             }
         }
@@ -4620,6 +4609,16 @@ static bool PresentImpl(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swap, int swa
             sCamGround += (g - sCamGround) * 0.08f;
             if (std::fabs(g - sCamGround) > 64.0f) /* new room: no slow climb */
                 sCamGround = g;
+        }
+        /* ponytail: debug knob — TMC_VOXEL_FOCUS_TILE=tx,ty: aim the free
+         * camera at a room tile, on its ground (height and south shift) */
+        if (const char* ft = std::getenv("TMC_VOXEL_FOCUS_TILE")) {
+            int fx = 0, fy = 0;
+            if (std::sscanf(ft, "%d,%d", &fx, &fy) == 2 && fx >= 0 && fy >= 0 && fx < 64 && fy < 64) {
+                const float g = fx < sTerrainW && fy < sTerrainHt ? sTerrainH[fy * 64 + fx] : 0.0f;
+                sCam.free = sCam.absolute = true;
+                sCam.ox = fx * 16.0f + 8.0f, sCam.oz = fy * 16.0f + 8.0f + g, sCam.oy = g + 6.0f;
+            }
         }
         const float target3[3] = { sCam.absolute ? sCam.ox : scrollX + viewW * 0.5f + sCam.ox,
                                    sCam.absolute ? sCam.oy : sCamGround + sCam.oy,
