@@ -1072,6 +1072,48 @@ void BuildMap(void) {
         Quad(sMapVerts, kMaxMapVerts, n, c, east ? u0 : u0 + 16, v0, east ? u0 + 16 : u0, v0 + 16, 0,
              top ? 128u : 0u, top ? tChar : bChar, (top ? t8 : b8) | 2u | (fill << 20) | (mask << 8));
     };
+    /* A prop (sapling, stump, sign, pot) as a pillar round the tile's centre:
+     * each run of art rows with the same opaque extent becomes a square slab
+     * that wide, every side wearing those rows. Solid from any angle, like a
+     * voxel model, at a handful of quads. slot: the prop's mask (1-based). */
+    auto pillar = [&](int x, int y, Uint32 slot) {
+        const int ox = (int)((slot - 1) % 16) * 16, oy = (int)((slot - 1) / 16) * 16;
+        int extL[16], extR[16];
+        for (int r = 0; r < 16; ++r) {
+            extL[r] = 16, extR[r] = -1;
+            for (int c = 0; c < 16; ++c)
+                if (sMaskPixels[(oy + r) * 256 + ox + c])
+                    extL[r] = std::min(extL[r], c), extR[r] = c;
+        }
+        const float cx = x * 16.0f + 8.0f, cz = y * 16.0f + 8.0f;
+        const Uint32 params = baseParams(slot, 0);
+        for (int r0 = 0; r0 < 16;) {
+            int r1 = r0 + 1;
+            while (r1 < 16 && extL[r1] == extL[r0] && extR[r1] == extR[r0])
+                ++r1;
+            if (extR[r0] >= 0) {
+                /* rows r0..r1-1, top of the tile = 16 px up */
+                const float hw = (extR[r0] - extL[r0] + 1) * 0.5f, hTop = 16.0f - r0, hBot = 16.0f - r1;
+                const float u0 = x * 16.0f + extL[r0], u1 = x * 16.0f + extR[r0] + 1;
+                const float v0 = y * 16.0f + r0, v1 = y * 16.0f + r1;
+                const float xa = cx - hw, xb = cx + hw, za = cz - hw, zb = cz + hw;
+                const float faces[4][4][3] = {
+                    { { xa, hTop, zb }, { xb, hTop, zb }, { xa, hBot, zb }, { xb, hBot, zb } }, /* south */
+                    { { xb, hTop, za }, { xa, hTop, za }, { xb, hBot, za }, { xa, hBot, za } }, /* north */
+                    { { xa, hTop, za }, { xa, hTop, zb }, { xa, hBot, za }, { xa, hBot, zb } }, /* west */
+                    { { xb, hTop, zb }, { xb, hTop, za }, { xb, hBot, zb }, { xb, hBot, za } }, /* east */
+                };
+                for (const auto& f : faces)
+                    Quad(sMapVerts, kMaxMapVerts, n, f, u0, v0, u1, v1, 0, 0u, bChar, params);
+                /* the slab's top, where it sticks out past the one above */
+                if (r0 == 0 || extR[r0 - 1] < 0 || extL[r0 - 1] > extL[r0] || extR[r0 - 1] < extR[r0]) {
+                    const float top[4][3] = { { xa, hTop, za }, { xb, hTop, za }, { xa, hTop, zb }, { xb, hTop, zb } };
+                    Quad(sMapVerts, kMaxMapVerts, n, top, u0, v0, u1, v0 + 1, 0, 0u, bChar, params);
+                }
+            }
+            r0 = r1;
+        }
+    };
     /* Vertical lip of a sunk tile along one edge, heights d..0. */
     auto lip = [&](int x, int y, int edge, float d) {
         const float x0 = x * 16.0f, x1 = x0 + 16, z0 = y * 16.0f, z1 = z0 + 16;
@@ -1232,10 +1274,8 @@ void BuildMap(void) {
         for (int x = 0; x < W; ++x) {
             const int t = y * 64 + x;
             if (kind[t] == 1) {
-                /* Two crossed cards, so the prop has body from any side. */
                 underlay(x, y);
-                wallV(x, y, y * 16.0f + 8.0f, 0.0f, 16.0f, propSlot[t]);
-                sideV(x, y, false, y * 16.0f, y * 16.0f + 16, 16.0f, 0u, propSlot[t], x * 16.0f + 8.0f);
+                pillar(x, y, propSlot[t]);
             } else if (kind[t] == 3) {
                 underlay(x, y);
                 flatV(x, y, 0.2f, y * 16.0f, y * 16.0f + 16, 0);
