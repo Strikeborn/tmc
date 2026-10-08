@@ -1964,14 +1964,17 @@ void BuildMap(void) {
         measure();
         /* mostly not grass: maybe a fence along a cliff's top, standing on
          * the cliff's dirt */
-        if (count > 210 && inRoom(x, y + 1) && Geom(x, y + 1) &&
+        /* a fence of thick posts and planks leaves little grass showing:
+         * only past that is it maybe on a cliff's dirt (whose browns are the
+         * wood's too, so it's the last resort) */
+        if (count > 236 && inRoom(x, y + 1) && Geom(x, y + 1) &&
             BottomTileType((y + 1) * 64 + x) != BottomTileType(y * 64 + x)) {
             addGround(x, y + 1, true);
             measure();
         }
         if (std::getenv("TMC_VOXEL_DUMPMAP"))
             std::fprintf(stderr, "[voxel-cut] %d,%d ground colours %d object %d\n", x, y, ng, count);
-        if (count < 24 || count > 210)
+        if (count < 24 || count > 236)
             return false;
         const int ox = (sPropCount % 16) * 16, oy = (sPropCount / 16) * 16;
         for (int i = 0; i < 256; ++i)
