@@ -2682,6 +2682,15 @@ void BuildMap(void) {
         sTerrainW = W, sTerrainHt = H;
         if (std::getenv("TMC_VOXEL_DUMPMAP")) {
             std::fprintf(stderr, "[voxel-terrain] %d areas, %zu links\n", nreg, links.size());
+            /* both collision layers: bottom coll/act | top coll/act */
+            for (int y = 0; y < H; ++y) {
+                std::fprintf(stderr, "[voxel-layers] %2d", y);
+                for (int x = 0; x < W; ++x)
+                    std::fprintf(stderr, " %02x%02x|%02x%02x", gMapBottom.collisionData[y * 64 + x],
+                                 gMapBottom.actTiles[y * 64 + x], gMapTop.collisionData[y * 64 + x],
+                                 gMapTop.actTiles[y * 64 + x]);
+                std::fprintf(stderr, "\n");
+            }
             for (int y = 0; y < H; ++y) {
                 char line[80];
                 for (int x = 0; x < W; ++x) {

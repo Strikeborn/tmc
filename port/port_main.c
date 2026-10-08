@@ -580,6 +580,24 @@ int main(int argc, char* argv[]) {
     }
     (void)prerenderer; /* Owned by the window; retrieved via SDL_GetRenderer(window) later. */
 #endif
+    /* ponytail: debug knob — TMC_WINDOW_DISPLAY=right|<index>: open the
+     * window centred on that monitor (test runs off the main screen). */
+    if (const char* want = getenv("TMC_WINDOW_DISPLAY")) {
+        int count = 0;
+        SDL_DisplayID* ids = SDL_GetDisplays(&count);
+        SDL_DisplayID pick = 0;
+        int bestX = -0x7FFFFFFF;
+        for (int i = 0; ids && i < count; ++i) {
+            SDL_Rect r;
+            if (!SDL_GetDisplayBounds(ids[i], &r))
+                continue;
+            if (strcmp(want, "right") == 0 ? r.x > bestX : i == atoi(want))
+                bestX = r.x, pick = ids[i];
+        }
+        if (pick)
+            SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED_DISPLAY(pick), SDL_WINDOWPOS_CENTERED_DISPLAY(pick));
+        SDL_free(ids);
+    }
 
     /* Set window icon BEFORE first present so the title-bar and
      * taskbar entry never flash the default SDL icon. */
