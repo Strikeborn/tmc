@@ -68,9 +68,21 @@ let edits = {};
 try { edits = JSON.parse(localStorage.getItem('voxel-link-edits') || '{}'); } catch (e) { edits = {}; }
 function keep() { try { localStorage.setItem('voxel-link-edits', JSON.stringify(edits)); } catch (e) {} }
 function stepEdits(pose, s) { ((edits[pose] ||= {})[s] ||= { del: [], set: [] }); return edits[pose][s]; }
+/* Models are packed by build.py: u32 count, int16 x,y,z per voxel, then u8 r,g,b. */
+const decoded = {};
+function decode(pose, s) {
+  const key = pose + '#' + s;
+  if (decoded[key]) return decoded[key];
+  const bin = Uint8Array.from(atob(MODELS[pose][s]), c => c.charCodeAt(0));
+  const n = new DataView(bin.buffer).getUint32(0, true);
+  const xyz = new Int16Array(bin.buffer.slice(4, 4 + n * 6)), rgb = bin.subarray(4 + n * 6);
+  const out = new Array(n);
+  for (let i = 0; i < n; i++) out[i] = [xyz[i * 3], xyz[i * 3 + 1], xyz[i * 3 + 2], rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2]];
+  return (decoded[key] = out);
+}
 function voxels(pose, s) {
   const e = edits[pose] && edits[pose][s];
-  let v = MODELS[pose][s].map(p => p.slice());
+  let v = decode(pose, s).map(p => p.slice());
   if (!e) return v;
   const gone = new Set(e.del.map(p => p.join()));
   const set = new Map(e.set.map(p => [p.slice(0, 3).join(), p.slice(3, 6)]));
