@@ -156,6 +156,11 @@ void UpdateCam(void) {
     if (sCam.cfgPitch != Port_Config_GetVoxelPitch()) {
         sCam.cfgPitch = Port_Config_GetVoxelPitch();
         sCam.pitch = (float)sCam.cfgPitch;
+        /* ponytail: debug knob — fixed start angle for scripted shots. */
+        if (const char* y = std::getenv("TMC_VOXEL_YAW"))
+            sCam.yaw = (float)std::atof(y);
+        if (const char* p = std::getenv("TMC_VOXEL_PITCH"))
+            sCam.pitch = (float)std::atof(p);
     }
     float turn = 0.0f, tilt = 0.0f, zoom = 0.0f;
     if (!Port_DebugMenu_IsOpen() && !Port_ImGui_WantsTextInput()) {
@@ -802,6 +807,26 @@ bool BuildPropMask(int x, int y, int slot, Uint32 charBase, bool bpp8) {
     return BuildMask([&](int px, int py) { return BottomPixel(x, y, px, py, charBase, bpp8); }, slot);
 }
 
+/* Prop whose outline is open (a sapling's leaves reach the tile edge): the
+ * object is whatever differs from the ground tile (ux,uy) it was painted
+ * over, pixel for pixel. Fails when that is most of the tile (not an object
+ * on that ground) or too little to see. */
+bool BuildDiffMask(int x, int y, int ux, int uy, int slot, Uint32 charBase, bool bpp8) {
+    bool obj[256];
+    int count = 0;
+    for (int i = 0; i < 256; ++i) {
+        const int px = i & 15, py = i >> 4;
+        obj[i] = BottomPixel(x, y, px, py, charBase, bpp8) != BottomPixel(ux, uy, px, py, charBase, bpp8);
+        count += obj[i];
+    }
+    if (count < 24 || count > 200)
+        return false;
+    const int ox = (slot % 16) * 16, oy = (slot / 16) * 16;
+    for (int i = 0; i < 256; ++i)
+        sMaskPixels[(oy + (i >> 4)) * 256 + ox + (i & 15)] = obj[i] ? 255 : 0;
+    return true;
+}
+
 bool TopTileEmpty(int x, int y) {
     const u16* s = &gMapDataTopSpecial[y * 2 * 128 + x * 2];
     return (s[0] | s[1] | s[128] | s[129]) == 0;
@@ -1042,13 +1067,29 @@ void BuildMap(void) {
     /* A lone solid tile read as an outlined prop (bush, pot, sign, stump):
      * stands as a per-pixel card mid-tile over borrowed ground. On success the
      * mask lands in slot sPropCount - 1 (params carry sPropCount). */
+    /* A solid neighbour of the same tile type continues this object (a fence,
+     * a wall); one of a different type is a separate object it just touches,
+     * like a sapling planted against a tree's trunk. */
+    auto joins = [&](int x, int y, int nx, int ny) {
+        return Geom(nx, ny) && BottomTileType(ny * 64 + nx) == BottomTileType(y * 64 + x);
+    };
     auto isProp = [&](int x, int y) -> bool {
         const int ov = TileOverride(y * 64 + x);
-        if (ov == PORT_VOXEL_SHAPE_FLOOR || ov == PORT_VOXEL_SHAPE_BLOCK || sPropCount >= kMaxProps || Cover(x, y))
+        if (ov == PORT_VOXEL_SHAPE_FLOOR || ov == PORT_VOXEL_SHAPE_BLOCK || sPropCount >= kMaxProps ||
+            Cover(x, y) == 2)
             return false;
-        if (ov != PORT_VOXEL_SHAPE_PROP && (Geom(x, y - 1) || Geom(x, y + 1) || Geom(x - 1, y) || Geom(x + 1, y)))
+        const bool alone = !Geom(x, y - 1) && !Geom(x, y + 1) && !Geom(x - 1, y) && !Geom(x + 1, y);
+        if (ov != PORT_VOXEL_SHAPE_PROP && !alone) {
+            /* Touching other solids: only an outlined object of its own type
+             * (the mask test below rejects wall art reaching the tile edges). */
+            if (joins(x, y, x, y - 1) || joins(x, y, x, y + 1) || joins(x, y, x - 1, y) || joins(x, y, x + 1, y))
+                return false;
+        } else if (ov != PORT_VOXEL_SHAPE_PROP && Cover(x, y)) {
             return false;
-        if (!BuildPropMask(x, y, sPropCount, bChar, b8 != 0))
+        }
+        int ux, uy;
+        if (!BuildPropMask(x, y, sPropCount, bChar, b8 != 0) &&
+            !(groundFor(x, y, ux, uy) && BuildDiffMask(x, y, ux, uy, sPropCount, bChar, b8 != 0)))
             return false;
         ++sPropCount;
         return true;
@@ -1063,6 +1104,22 @@ void BuildMap(void) {
         bool ledge;
     };
     std::vector<Run> runs;
+    /* Trunk rows: mostly dark art under foliage. A tree's middle trunk tile
+     * is lighter (bark, not shadow), so a row flanked by trunk on both sides
+     * under foliage counts too, or that one column stands out as a slab. */
+    static Uint8 trunk[64 * 64];
+    std::memset(trunk, 0, sizeof(trunk));
+    if (outdoors) {
+        for (int y = 1; y < H; ++y)
+            for (int x = 0; x < W; ++x)
+                trunk[y * 64 + x] = Geom(x, y) && Geom(x, y - 1) && DarkTile(x, y) && Foliage(x, y - 1);
+        for (int y = 1; y < H; ++y)
+            for (int x = 1; x + 1 < W; ++x) {
+                const int t = y * 64 + x;
+                if (!trunk[t] && trunk[t - 1] && trunk[t + 1] && Geom(x, y) && Geom(x, y - 1) && Foliage(x, y - 1))
+                    trunk[t] = 2; /* 2 = flanked */
+            }
+    }
     static Uint8 kind[64 * 64]; /* 0 floor, 1 prop, 2 box, 3 trunk (flat) */
     static Uint32 propSlot[64 * 64];
     static float hmap[64 * 64];
@@ -1088,7 +1145,7 @@ void BuildMap(void) {
             /* Big trees' bottom rows are cast shadow and trunk: mostly dark
              * art under the canopy. They lie on the ground, the canopy box
              * stands above them. */
-            while (outdoors && yb > yt && DarkTile(x, yb) && Foliage(x, yb - 1)) {
+            while (outdoors && yb > yt && trunk[yb * 64 + x]) {
                 kind[yb * 64 + x] = 3;
                 --yb;
             }
@@ -1109,6 +1166,24 @@ void BuildMap(void) {
             for (int b = rn.foot; b <= yb; ++b)
                 hmap[b * 64 + x] = rn.topH;
             runs.push_back(rn);
+        }
+    }
+    /* ponytail: debug knob — TMC_VOXEL_DUMPMAP=<file>: per-tile classification
+     * of each rebuilt room (kind, cover, bottom tile type), for tuning. */
+    if (const char* dumpPath = std::getenv("TMC_VOXEL_DUMPMAP")) {
+        if (FILE* f = std::fopen(dumpPath, "a")) {
+            std::fprintf(f, "room area=0x%02x room=0x%02x %dx%d (kind: .floor P prop B box T trunk; "
+                            "cover: space none, - partial, # opaque; type hex)\n",
+                         gRoomControls.area, gRoomControls.room, W, H);
+            for (int y = 0; y < H; ++y) {
+                std::fprintf(f, "%2d ", y);
+                for (int x = 0; x < W; ++x) {
+                    const int t = y * 64 + x;
+                    std::fprintf(f, "%c%c%03x ", ".PBT"[kind[t]], " -#"[cover[t]], BottomTileType(t) & 0xFFF);
+                }
+                std::fputc('\n', f);
+            }
+            std::fclose(f);
         }
     }
     auto hAt = [&](int x, int b) { return inRoom(x, b) ? hmap[b * 64 + x] : 0.0f; };

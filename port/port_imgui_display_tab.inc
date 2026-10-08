@@ -272,16 +272,28 @@ static void DrawRibbonDisplayTab(void) {
         auto refresh = [&] {
             sPresetPaths.clear();
             std::error_code ec;
-            std::vector<std::string> roots;
+            /* Preset folders are searched recursively; the game folder itself
+             * only at its top level, since it holds the ~20k-file asset tree
+             * and walking that stalled the first open of this tab. */
+            std::vector<std::string> roots, flatRoots;
             if (const char* base = SDL_GetBasePath()) {
                 std::string b = base;
                 roots.push_back(b + "shaders");
                 roots.push_back(b + "glslp");
-                roots.push_back(b);
+                flatRoots.push_back(b);
             }
             roots.emplace_back("shaders");
             roots.emplace_back("glslp");
-            roots.emplace_back(".");
+            flatRoots.emplace_back(".");
+            for (const auto& root : flatRoots) {
+                std::error_code dec;
+                std::filesystem::directory_iterator it(root, dec);
+                for (; !dec && it != std::filesystem::directory_iterator(); it.increment(dec)) {
+                    std::error_code fec;
+                    if (it->is_regular_file(fec) && it->path().extension() == ".glslp")
+                        sPresetPaths.push_back(it->path().string());
+                }
+            }
             for (const auto& root : roots) {
                 std::error_code dec;
                 if (!std::filesystem::is_directory(root, dec)) continue;

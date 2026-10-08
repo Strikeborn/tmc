@@ -317,6 +317,35 @@ void Port_ReproNpcTalk_Tick(unsigned int frame) {
         VoxelTourTick(frame);
         return;
     }
+    /* ponytail: debug knob — TMC_VOXEL_SHOT=<dir>: once warped, let the room
+     * settle, write <dir>/3d.png (3D view) and <dir>/2d.png (GBA frame), then
+     * exit. Pair with TMC_VOXEL_YAW / TMC_VOXEL_PITCH for other angles. */
+    {
+        const char* shot = getenv("TMC_VOXEL_SHOT");
+        if (shot && *shot) {
+            static unsigned int since = 0;
+            if (since == 0)
+                since = frame;
+            gSave.stats.health = gSave.stats.maxHealth;
+            if (gPlayerState.controlMode != CONTROL_ENABLED && frame % 40 < 2)
+                Port_Config_TestForceEdge(PORT_INPUT_A);
+            if (frame - since == 150) {
+                char path[512];
+                snprintf(path, sizeof(path), "%s/3d.png", shot);
+                Port_Voxel_RequestShot(path);
+                snprintf(path, sizeof(path), "%s/2d.png", shot);
+                Port_CaptureBaseFramebufferPNG(path);
+                fprintf(stderr, "[voxshot] area=0x%02x room=0x%02x scroll=%d,%d\n", gRoomControls.area,
+                        gRoomControls.room, gRoomControls.scroll_x - gRoomControls.origin_x,
+                        gRoomControls.scroll_y - gRoomControls.origin_y);
+            }
+            if (frame - since == 180) {
+                fflush(stderr);
+                _Exit(0);
+            }
+            return;
+        }
+    }
 
     /* Success oracle: message box opened (talk succeeded). MESSAGE_ACTIVE
      * is 0x7f — any live message phase counts. Check FIRST so the
