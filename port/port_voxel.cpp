@@ -1059,11 +1059,16 @@ void BuildMap(void) {
     /* Box side on plane x = xs, heights 0..h over z0..z1, wearing tile (x,y)'s
      * visible art with its width along the depth; see-through texels take
      * `fill` so the box is always closed. West sides mirror (u reversed). */
-    auto sideV = [&](int x, int y, bool east, float z0, float z1, float h, Uint32 fill, Uint32 mask) {
-        const float xs = east ? x * 16.0f + 16 : x * 16.0f;
+    /* Side wall at x's west or east edge (or at xAt), wearing tile (sx, sy)'s
+     * art: by default (x, y) itself. */
+    auto sideV = [&](int x, int y, bool east, float z0, float z1, float h, Uint32 fill, Uint32 mask,
+                     float xAt = -1.0f, int sx = -1, int sy = -1) {
+        if (sx < 0)
+            sx = x, sy = y;
+        const float xs = xAt >= 0.0f ? xAt : east ? x * 16.0f + 16 : x * 16.0f;
         const float c[4][3] = { { xs, h, z0 }, { xs, h, z1 }, { xs, 0, z0 }, { xs, 0, z1 } };
-        const float u0 = x * 16.0f, v0 = y * 16.0f;
-        const bool top = Cover(x, y) != 0;
+        const float u0 = sx * 16.0f, v0 = sy * 16.0f;
+        const bool top = Cover(sx, sy) != 0;
         Quad(sMapVerts, kMaxMapVerts, n, c, east ? u0 : u0 + 16, v0, east ? u0 + 16 : u0, v0 + 16, 0,
              top ? 128u : 0u, top ? tChar : bChar, (top ? t8 : b8) | 2u | (fill << 20) | (mask << 8));
     };
@@ -1107,10 +1112,17 @@ void BuildMap(void) {
             return false;
         const bool alone = !Geom(x, y - 1) && !Geom(x, y + 1) && !Geom(x - 1, y) && !Geom(x + 1, y);
         if (ov != PORT_VOXEL_SHAPE_PROP && !alone) {
-            /* Touching other solids: only an outlined object of its own type
-             * (the mask test below rejects wall art reaching the tile edges). */
-            if (joins(x, y, x, y - 1) || joins(x, y, x, y + 1) || joins(x, y, x - 1, y) || joins(x, y, x + 1, y))
-                return false;
+            /* Touching other solids of its own type, a bush in a bush patch
+             * is still its own object: leafy art fully outlined inside the
+             * tile. (Ledges, fences and doors outline too, so foliage only.) */
+            if (joins(x, y, x, y - 1) || joins(x, y, x, y + 1) || joins(x, y, x - 1, y) || joins(x, y, x + 1, y)) {
+                if (Cover(x, y) || !outdoors || !Foliage(x, y) || !BuildPropMask(x, y, sPropCount, bChar, b8 != 0))
+                    return false;
+                ++sPropCount;
+                return true;
+            }
+            /* Touching another kind of solid (a sapling against a trunk):
+             * the tests below decide. */
         } else if (ov != PORT_VOXEL_SHAPE_PROP && Cover(x, y)) {
             return false;
         }
@@ -1220,8 +1232,10 @@ void BuildMap(void) {
         for (int x = 0; x < W; ++x) {
             const int t = y * 64 + x;
             if (kind[t] == 1) {
+                /* Two crossed cards, so the prop has body from any side. */
                 underlay(x, y);
-                wallV(x, y, y * 16.0f + 10.0f, 0.0f, 16.0f, propSlot[t]);
+                wallV(x, y, y * 16.0f + 8.0f, 0.0f, 16.0f, propSlot[t]);
+                sideV(x, y, false, y * 16.0f, y * 16.0f + 16, 16.0f, 0u, propSlot[t], x * 16.0f + 8.0f);
             } else if (kind[t] == 3) {
                 underlay(x, y);
                 flatV(x, y, 0.2f, y * 16.0f, y * 16.0f + 16, 0);
@@ -1312,10 +1326,27 @@ void BuildMap(void) {
         for (int b = thin ? yb : rn.foot; b <= yb; ++b) {
             const float z0 = thin ? zFace - 8.0f : b * 16.0f, z1 = thin ? zFace : b * 16.0f + 16;
             const int r = artRow(b);
-            if (hAt(x - 1, b) < topH && x > 0)
-                sideV(x, r, false, z0, z1, topH, (Uint32)fill, rowMask[r]);
-            if (hAt(x + 1, b) < topH && x < W - 1)
-                sideV(x, r, true, z0, z1, topH, (Uint32)fill, rowMask[r]);
+            /* A canopy's side wears leaves from inside the same tree, not a
+             * stretched copy of its outlined edge tile. */
+            auto leafFrom = [&](int dir, int& sx) {
+                sx = -1;
+                if (!outdoors || !Foliage(x, r))
+                    return;
+                for (int k = 1; k <= 3; ++k)
+                    if (Cover(x + dir * k, r) == 2 && Foliage(x + dir * k, r)) {
+                        sx = x + dir * k;
+                        return;
+                    }
+            };
+            int sx;
+            if (hAt(x - 1, b) < topH && x > 0) {
+                leafFrom(1, sx);
+                sideV(x, r, false, z0, z1, topH, (Uint32)fill, rowMask[r], -1.0f, sx, sx < 0 ? -1 : r);
+            }
+            if (hAt(x + 1, b) < topH && x < W - 1) {
+                leafFrom(-1, sx);
+                sideV(x, r, true, z0, z1, topH, (Uint32)fill, rowMask[r], -1.0f, sx, sx < 0 ? -1 : r);
+            }
         }
     }
     if (topBelow) {
