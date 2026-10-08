@@ -2568,6 +2568,22 @@ void BuildMap(void) {
                 }
         /* boxes stand on the area in front of them (south), else behind */
         for (const Run& rn : runs) {
+            /* a cliff's side (every tile tagged so): a wall whose top is the
+             * plateau it edges (its higher neighbour), not a box in front */
+            bool side = true;
+            float hp = -1e9f;
+            for (int r = rn.yt; r <= rn.yb; ++r) {
+                const int a = act(rn.x, r);
+                side &= a == 0x2c || a == 0x2d;
+                for (int dx = -1; dx <= 1; dx += 2)
+                    if (inField(rn.x + dx, r))
+                        hp = std::max(hp, terr[r * 64 + rn.x + dx]);
+            }
+            if (side && hp > -1e8f) {
+                for (int r = rn.yt; r <= rn.yb; ++r)
+                    terr[r * 64 + rn.x] = hp, hmap[r * 64 + rn.x] = hp;
+                continue;
+            }
             float base = 0.0f;
             if (inField(rn.x, rn.yb + 1))
                 base = terr[(rn.yb + 1) * 64 + rn.x];
@@ -2930,6 +2946,16 @@ void BuildMap(void) {
         }
     };
 
+    /* the room's cliff dirt: a south cliff face tile's art (walls between
+     * levels wear it, not the grass on top) */
+    int dirtX = -1, dirtY = -1;
+    for (int y = H - 1; y >= 0 && dirtX < 0; --y)
+        for (int x = 0; x < W; ++x)
+            if (gMapBottom.actTiles[y * 64 + x] == 0x2a && kind[y * 64 + x] == 2 &&
+                (y + 1 >= H || gMapBottom.actTiles[(y + 1) * 64 + x] != 0x2a)) {
+                dirtX = x, dirtY = y;
+                break;
+            }
     /* ---- pass 2: draw ----
      * Everything is built at ground 0 and lifted to its terrain height. The
      * GBA draws raised ground shifted up the screen by its height (a screen
@@ -3029,11 +3055,15 @@ void BuildMap(void) {
         }
     /* where neighbouring ground stands at different heights (an area's edge
      * with no cliff box: a cliff's end, a raised path) a face closes the
-     * step, wearing the higher tile's art */
+     * step, wearing the room's cliff dirt (a cliff face tile's art), not the
+     * grass on top */
+    auto stairTile = [&](int t) {
+        return kind[t] == 0 && (gMapBottom.actTiles[t] == 0x26 || gMapBottom.actTiles[t] == 0x27 || gMapBottom.actTiles[t] == 0x34);
+    };
     for (int y = 0; y < H; ++y)
         for (int x = 0; x < W; ++x) {
             const int t = y * 64 + x;
-            if (kind[t] == 2)
+            if (kind[t] == 2 || stairTile(t))
                 continue;
             static const int d[4][2] = { { 0, 1 }, { 0, -1 }, { 1, 0 }, { -1, 0 } };
             for (int e = 0; e < 4; ++e) {
@@ -3042,6 +3072,8 @@ void BuildMap(void) {
                     continue;
                 /* down to a box: to its top (a cliff top lower than this ground) */
                 const int nt = ny * 64 + nx;
+                if (stairTile(nt))
+                    continue;
                 const float lo = kind[nt] == 2 ? std::max(hmap[nt], terr[nt]) : terr[nt], hi = terr[t];
                 if (hi - lo < 1.0f)
                     continue;
@@ -3057,7 +3089,11 @@ void BuildMap(void) {
                 }
                 else if (e == 2) { const float q[4][3] = { { x1, hi, z1 }, { x1, hi, z0 }, { x1, lo, z1 }, { x1, lo, z0 } }; std::memcpy(c, q, sizeof c); }
                 else { const float q[4][3] = { { x0, hi, z0 }, { x0, hi, z1 }, { x0, lo, z0 }, { x0, lo, z1 } }; std::memcpy(c, q, sizeof c); }
-                Quad(sMapVerts, kMaxMapVerts, n, c, x0, z0, x1, z1, 0, 0u, bChar, b8);
+                if (dirtX >= 0)
+                    Quad(sMapVerts, kMaxMapVerts, n, c, dirtX * 16.0f, dirtY * 16.0f, dirtX * 16.0f + 16, dirtY * 16.0f + 16,
+                         0, 0u, bChar, b8);
+                else
+                    Quad(sMapVerts, kMaxMapVerts, n, c, x0, z0, x1, z1, 0, 0u, bChar, b8);
             }
         }
     /* shrubs: their art's outline (traced across their tiles together) as
@@ -3165,7 +3201,7 @@ void BuildMap(void) {
                  * end; the rows above that are its height. */
                 const int pw = c1 - c0 + 1, ph = r1 - r0 + 1;
                 const float rx = pw * 0.5f, rz = std::min(pw, ph) * 0.5f;
-                const float Hh = std::clamp((float)(ph - std::min(pw, ph)), rz * 0.8f, (float)NH2 - 1.0f);
+                const float Hh = std::clamp(rz * 0.95f, 8.0f, (float)NH2 - 1.0f); /* round, not a tall egg */
                 const float dcx = c0 + rx, dcz = r1 + 1 - rz;
                 for (int vx = std::max(0, c0); vx <= std::min(PW - 1, c1); ++vx)
                     for (int vz = std::max(0, (int)(dcz - rz)); vz <= std::min(PH - 1, r1); ++vz) {
@@ -3263,6 +3299,41 @@ void BuildMap(void) {
         const int x = rn.x, yt = rn.yt, yb = rn.yb, face = rn.face;
         const float topH = rn.topH, zFace = (yb + 1) * 16.0f;
         const float base = terr[yb * 64 + x];
+        {
+            bool side = outdoors;
+            for (int r = yt; r <= yb && side; ++r)
+                side = gMapBottom.actTiles[r * 64 + x] == 0x2c || gMapBottom.actTiles[r * 64 + x] == 0x2d;
+            if (side) {
+                /* a cliff's side: its own art on top at the plateau's level
+                 * (shifted south with it), dirt walls down to lower ground */
+                const float hp = base;
+                auto dirtFace = [&](const float (&c)[4][3], int ax, int ay) {
+                    const int ux = dirtX >= 0 ? dirtX : ax, uy = dirtX >= 0 ? dirtY : ay;
+                    Quad(sMapVerts, kMaxMapVerts, n, c, ux * 16.0f, uy * 16.0f, ux * 16.0f + 16, uy * 16.0f + 16, 0, 0u,
+                         bChar, b8);
+                };
+                for (int r = yt; r <= yb; ++r) {
+                    const float z0 = r * 16.0f + hp, z1 = z0 + 16, x0 = x * 16.0f, x1 = x0 + 16;
+                    flatV(x, r, hp, z0, z1, 0);
+                    for (int e = 0; e < 2; ++e) {
+                        const int nx = e ? x + 1 : x - 1;
+                        if (!inRoom(nx, r))
+                            continue;
+                        const float lo = std::max(hAt(nx, r), terr[r * 64 + nx]);
+                        if (lo >= hp - 0.5f)
+                            continue;
+                        if (e) {
+                            const float c[4][3] = { { x1, hp, z1 }, { x1, hp, z0 }, { x1, lo, z1 }, { x1, lo, z0 } };
+                            dirtFace(c, x, r);
+                        } else {
+                            const float c[4][3] = { { x0, hp, z0 }, { x0, hp, z1 }, { x0, lo, z0 }, { x0, lo, z1 } };
+                            dirtFace(c, x, r);
+                        }
+                    }
+                }
+                continue;
+            }
+        }
         /* ground behind as high as the top (a cliff under a plateau): the
          * plateau's own ground reaches the wall's top, so this run draws no
          * ground behind its footprint and no cap of its own over it */
@@ -3364,13 +3435,22 @@ void BuildMap(void) {
                     }
             };
             int sx;
+            bool cliffRun = false;
+            for (int rr = yt; rr <= yb && !cliffRun; ++rr)
+                cliffRun = CliffTile(x, rr);
             if ((hx || hAt(x - 1, b) < base + topH) && x > 0) {
                 leafFrom(1, sx);
-                sideV(x, r, false, z0, z1, topH, (Uint32)fill, rowMask[r], -1.0f, sx, sx < 0 ? -1 : r);
+                if (cliffRun && dirtX >= 0)
+                    sideV(x, r, false, z0, z1, topH, (Uint32)fill, 0, -1.0f, dirtX, dirtY);
+                else
+                    sideV(x, r, false, z0, z1, topH, (Uint32)fill, rowMask[r], -1.0f, sx, sx < 0 ? -1 : r);
             }
             if ((hx || hAt(x + 1, b) < base + topH) && x < W - 1) {
                 leafFrom(-1, sx);
-                sideV(x, r, true, z0, z1, topH, (Uint32)fill, rowMask[r], -1.0f, sx, sx < 0 ? -1 : r);
+                if (cliffRun && dirtX >= 0)
+                    sideV(x, r, true, z0, z1, topH, (Uint32)fill, 0, -1.0f, dirtX, dirtY);
+                else
+                    sideV(x, r, true, z0, z1, topH, (Uint32)fill, rowMask[r], -1.0f, sx, sx < 0 ? -1 : r);
             }
         }
         /* Back: the GBA never shows a box's north side, but a free camera
@@ -3384,7 +3464,16 @@ void BuildMap(void) {
             const float lo = behind - base;
             if (lo < topH - 0.5f) {
                 const int r = artRow(thin ? yb : rn.foot);
-                wallV(x, r, zb, lo, topH - lo, rowMask[r], fillP);
+                bool cliffBack = false; /* a plateau's north edge: a ledge facing north, in dirt */
+                for (int rr = yt; rr <= yb && !cliffBack; ++rr)
+                    cliffBack = CliffTile(x, rr);
+                if (cliffBack && dirtX >= 0) {
+                    const float bx0 = x * 16.0f + clipL, bx1 = x * 16.0f + clipR;
+                    const float c[4][3] = { { bx1, topH, zb }, { bx0, topH, zb }, { bx1, lo, zb }, { bx0, lo, zb } };
+                    Quad(sMapVerts, kMaxMapVerts, n, c, dirtX * 16.0f, dirtY * 16.0f, dirtX * 16.0f + 16, dirtY * 16.0f + 16, 0, 0u, bChar, b8);
+                } else {
+                    wallV(x, r, zb, lo, topH - lo, rowMask[r], fillP);
+                }
                 /* and that lower ground runs on to the wall's foot (it is
                  * shifted south less than this box) */
                 if (lo < -0.5f && yt > 0 && kind[(yt - 1) * 64 + x] != 2)
