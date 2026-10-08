@@ -163,6 +163,8 @@ void UpdateCam(void) {
             sCam.yaw = (float)std::atof(y);
         if (const char* p = std::getenv("TMC_VOXEL_PITCH"))
             sCam.pitch = (float)std::atof(p);
+        if (const char* d = std::getenv("TMC_VOXEL_DIST")) /* times the default distance */
+            sCam.dist = sCam.distGoal = std::clamp(kDistance * (float)std::atof(d), kCamMinDist, kCamMaxDist);
     }
     float turn = 0.0f, tilt = 0.0f, zoom = 0.0f;
     if (!Port_DebugMenu_IsOpen() && !Port_ImGui_WantsTextInput()) {
@@ -1243,7 +1245,109 @@ void BuildMap(void) {
                     break;
                 }
         std::sort(runW, runW + nr);
-        const bool round = sPropOutlined[slot - 1] || nr == 0 || runW[nr / 2] > 6;
+        /* mostly leaves (green, not soil or wood): a bush, whatever its rows' widths */
+        int green = 0, all = 0;
+        for (int r = 0; r < 16; ++r)
+            for (int c = 0; c < 16; ++c)
+                if (on(c, r))
+                    ++all, green += !brown(pix(c, r)) && !Dark555(pix(c, r));
+        const bool leafy = all > 0 && green * 2 > all;
+        const bool round = sPropOutlined[slot - 1] || nr == 0 || runW[nr / 2] > 6 || leafy;
+        /* A leafy round plant (a bush: lobes of leaves, dark creases between,
+         * soil showing under it) is a 1-px heightfield of its art: every leaf
+         * pixel a column rising from the ground, highest in the middle of a
+         * lobe (far from the edge, lit), lower in the creases and at the rim.
+         * Soil stays the ground's. */
+        if (round) {
+            auto leafPx = [&](int c, int r) {
+                if (!on(c, r))
+                    return false;
+                const int p = pix(c, r);
+                return p >= 0 && !brown(p);
+            };
+            /* the black outline round the outside (its shadow ring) is the
+             * ground's; outline inside the clump is a crease between lobes */
+            auto part = [&](int c, int r) {
+                if (!leafPx(c, r))
+                    return false;
+                if (!Dark555(pix(c, r)))
+                    return true;
+                for (int k = 0; k < 4; ++k) {
+                    static const int d[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+                    if (!leafPx(c + d[k][0], r + d[k][1]))
+                        return false;
+                }
+                return true;
+            };
+            if (leafy) {
+                int dist[16][16] = {}, maxD = 0;
+                for (int r = 0; r < 16; ++r)
+                    for (int c = 0; c < 16; ++c) {
+                        if (!part(c, r))
+                            continue;
+                        int d = 1;
+                        for (; d < 8; ++d) { /* rings out to the nearest non-leaf pixel */
+                            bool hit = false;
+                            for (int k = -d; k <= d && !hit; ++k)
+                                hit = !part(c + k, r - d) || !part(c + k, r + d) || !part(c - d, r + k) ||
+                                      !part(c + d, r + k);
+                            if (hit)
+                                break;
+                        }
+                        dist[r][c] = d, maxD = std::max(maxD, d);
+                    }
+                const float Hmax = std::clamp(maxD * 3.0f, 8.0f, 13.0f);
+                int hgt[16][16] = {};
+                for (int r = 0; r < 16; ++r)
+                    for (int c = 0; c < 16; ++c)
+                        if (dist[r][c]) {
+                            const int p = pix(c, r);
+                            const float lum = ((p >> 5) & 31) / 31.0f;
+                            float h = Hmax * std::sqrt(std::min(1.0f, dist[r][c] / (float)maxD)) * (0.8f + 0.2f * lum);
+                            if (Dark555(p))
+                                h *= 0.75f; /* outline: a crease */
+                            hgt[r][c] = std::max(1, (int)std::lround(h));
+                        }
+                auto hAtP = [&](int c, int r) { return c >= 0 && c < 16 && r >= 0 && r < 16 ? hgt[r][c] : 0; };
+                const Uint32 params = baseParams(0, 0);
+                for (int r = 0; r < 16; ++r)
+                    for (int c = 0; c < 16; ++c) {
+                        const int h = hgt[r][c];
+                        if (!h)
+                            continue;
+                        const float px = x * 16.0f + c, pz = y * 16.0f + r, px1 = px + 1, pz1 = pz + 1, top = (float)h;
+                        const float u = px + 0.5f, v = pz + 0.5f;
+                        auto face = [&](const float (&q)[4][3]) {
+                            Quad(sMapVerts, kMaxMapVerts, n, q, u, v, u, v, 0, 0u, bChar, params);
+                        };
+                        {
+                            const float q[4][3] = { { px, top, pz }, { px1, top, pz }, { px, top, pz1 }, { px1, top, pz1 } };
+                            face(q);
+                        }
+                        float lo = (float)std::min(h, hAtP(c, r + 1));
+                        if (lo < top) {
+                            const float q[4][3] = { { px, top, pz1 }, { px1, top, pz1 }, { px, lo, pz1 }, { px1, lo, pz1 } };
+                            face(q);
+                        }
+                        lo = (float)std::min(h, hAtP(c, r - 1));
+                        if (lo < top) {
+                            const float q[4][3] = { { px1, top, pz }, { px, top, pz }, { px1, lo, pz }, { px, lo, pz } };
+                            face(q);
+                        }
+                        lo = (float)std::min(h, hAtP(c - 1, r));
+                        if (lo < top) {
+                            const float q[4][3] = { { px, top, pz }, { px, top, pz1 }, { px, lo, pz }, { px, lo, pz1 } };
+                            face(q);
+                        }
+                        lo = (float)std::min(h, hAtP(c + 1, r));
+                        if (lo < top) {
+                            const float q[4][3] = { { px1, top, pz1 }, { px1, top, pz }, { px1, lo, pz1 }, { px1, lo, pz } };
+                            face(q);
+                        }
+                    }
+                return;
+            }
+        }
         int V = 1;
         if (round) {
             /* A plant its outline closes in (garden plants, bushes, pots): a
@@ -1294,6 +1398,8 @@ void BuildMap(void) {
              * (the roots); everything off that run (stray leaves, root tips)
              * stays a thin piece where the art has it, plus a copy turned a
              * quarter, so it shows from every side without becoming a ring. */
+            /* the trunk's radius: its thin rows' width (the median run) */
+            const float trunkRad = std::clamp(runW[nr / 2] * 0.5f, 1.0f, 2.5f);
             for (int r = 0; r < 16; ++r) {
                 int l = -1, rr = -1;
                 for (int c0 : { 7, 8, 6, 9 })
@@ -1306,7 +1412,8 @@ void BuildMap(void) {
                         --l;
                     while (on(rr + 1, r))
                         ++rr;
-                    const float rad = std::max(std::fabs(l + 0.5f - 8.0f), std::fabs(rr + 0.5f - 8.0f));
+                    const float rad = std::min(std::max(std::fabs(l + 0.5f - 8.0f), std::fabs(rr + 0.5f - 8.0f)),
+                                               trunkRad);
                     for (int vx = 0; vx < 16; ++vx)
                         for (int vz = 0; vz < 16; ++vz) {
                             const float d = std::hypot(vx + 0.5f - 8.0f, vz + 0.5f - 8.0f);
@@ -1318,7 +1425,7 @@ void BuildMap(void) {
                         }
                 }
                 for (int c = 0; c < 16; ++c)
-                    if (on(c, r) && (l < 0 || c < l || c > rr)) {
+                    if (on(c, r) && (l < 0 || std::fabs(c + 0.5f - 8.0f) > trunkRad + 0.5f)) {
                         srcC[r][c][7] = srcC[r][c][8] = (Sint8)c, srcR[r][c][7] = srcR[r][c][8] = (Sint8)r;
                         srcC[r][7][c] = srcC[r][8][c] = (Sint8)c, srcR[r][7][c] = srcR[r][8][c] = (Sint8)r;
                     }
@@ -1891,8 +1998,48 @@ void BuildMap(void) {
             return i >= 0 && i < nx && j >= 0 && j < nh && k >= 0 && k < nz && occ[i][j][k];
         };
         bool trunkPass = false;
+        /* bark: the tree's own brown pixels (trunk, roots), else the room's
+         * darker browns (posts, stumps); a trunk is never leaf-green */
+        struct BarkPx {
+            short x, y;
+            bool top;
+        };
+        std::vector<BarkPx> bark;
+        auto barkish = [](int c) {
+            const int r = c & 31, g = (c >> 5) & 31;
+            return c >= 0 && r > g && std::max(r, g) < 24;
+        };
+        for (int ty = tr.y0; ty <= tr.y1; ++ty)
+            for (int tx = tr.x0; tx <= tr.x1; ++tx) {
+                if (treeOf[ty * 64 + tx] != id)
+                    continue;
+                for (int i = 0; i < 256; ++i) {
+                    const int ci = Cover(tx, ty) ? TopIndex(tx, ty, i & 15, i >> 4, tChar, t8 != 0) : -1;
+                    const int c = ci >= 0 ? gBgPltt[ci] : BottomPixel(tx, ty, i & 15, i >> 4, bChar, b8 != 0);
+                    if (barkish(c))
+                        bark.push_back({ (short)(tx * 16 + (i & 15)), (short)(ty * 16 + (i >> 4)), ci >= 0 });
+                }
+            }
+        if (bark.size() < 6) {
+            bark.clear();
+            for (int ty = 0; ty < H && bark.size() < 2048; ++ty)
+                for (int tx = 0; tx < W; ++tx)
+                    if (!Cover(tx, ty))
+                        for (int i = 0; i < 256; i += 5) {
+                            const int c = BottomPixel(tx, ty, i & 15, i >> 4, bChar, b8 != 0);
+                            if (barkish(c) && std::max(c & 31, (c >> 5) & 31) < 18)
+                                bark.push_back({ (short)(tx * 16 + (i & 15)), (short)(ty * 16 + (i >> 4)), false });
+                        }
+        }
         /* face colour: the art pixel the voxel lands on in the GBA's view */
         auto face = [&](const float (&q)[4][3], float px, float ph, float pz) {
+            if (trunkPass && !bark.empty()) {
+                const unsigned hsh = (unsigned)((int)px * 73856093u ^ (int)ph * 19349663u ^ (int)pz * 83492791u);
+                const BarkPx& b = bark[hsh % bark.size()];
+                Quad(sMapVerts, kMaxMapVerts, n, q, b.x + 0.5f, b.y + 0.5f, b.x + 0.5f, b.y + 0.5f, 0,
+                     b.top ? 128u : 0u, b.top ? tChar : bChar, b.top ? t8 : b8);
+                return;
+            }
             int sx2 = (int)px;
             const int sx = sx2;
             /* crown: the art row at this depth across the footprint (lower
@@ -1965,7 +2112,7 @@ void BuildMap(void) {
         {
             trunkPass = true;
             const float half = std::max(fx1 - fx0 + 1, fz1 - fz0 + 1) * 0.5f;
-            const float k = std::clamp(std::max(5.0f, half * 0.3f) / half, 0.1f, 1.0f), hr = 10.0f;
+            const float k = std::clamp(std::max(6.0f, half * 0.45f) / half, 0.1f, 1.0f), hr = 8.0f;
             const int bx0 = fx0 & ~1, bz0 = fz0 & ~1;
             const int mx = std::min((fx1 - bx0) / V + 1, 40), mz = std::min((fz1 - bz0) / V + 1, 40),
                       mh = std::min((int)((h0 + 6.0f) / V), 40);
