@@ -1300,7 +1300,21 @@ void BuildMap(void) {
          * the 2D view: it stands on the ground at its art's bottom row; each
          * art row is that many px up; a narrow run of a row (a post) turns
          * round, a wide one (a rail, a plank) is a 3-px-deep slab. */
-        if (sPropCutout[slot - 1]) {
+        /* leaves in the art: a sapling or bush; none: wood or stone (posts,
+         * double posts at a bridge's end, stumps), built off the 2D view */
+        int leafPxN = 0, woodPxN = 0, maskN = 0;
+        for (int r = 0; r < 16; ++r)
+            for (int c = 0; c < 16; ++c)
+                if (on(c, r)) {
+                    const int p = pix(c, r);
+                    const int pr = p & 31, pg = (p >> 5) & 31, pb = (p >> 10) & 31;
+                    ++maskN;
+                    leafPxN += p >= 0 && pg > pr && pg > pb && !Dark555(p);
+                    /* wood, stone or outline: not water's blues and teals */
+                    woodPxN += p >= 0 && (Dark555(p) || (pr >= pg && pr >= pb) ||
+                                          (std::abs(pr - pg) < 4 && std::abs(pg - pb) < 4));
+                }
+        if (sPropCutout[slot - 1] || (leafPxN < 6 && woodPxN * 3 >= maskN * 2)) {
             int rB = -1;
             for (int r = 0; r < 16; ++r)
                 for (int c = 0; c < 16; ++c)
@@ -1328,7 +1342,7 @@ void BuildMap(void) {
                         for (int vz = 0; vz < 16; ++vz) {
                             const float fx = vx + 0.5f, fz = vz + 0.5f;
                             bool in;
-                            if (w <= 6) /* post: round */
+                            if (w <= 6 || !sPropCutout[slot - 1]) /* post, or a lone object: round */
                                 in = std::hypot(fx - cx, fz - zc) <= w * 0.5f + 0.25f;
                             else /* rail: a slab */
                                 in = vx >= c && vx <= e && std::fabs(fz - zc) <= 1.5f;
@@ -1870,12 +1884,14 @@ void BuildMap(void) {
      * round it: what differs from the ground beside it stands up as itself,
      * not a box. A wall or cliff filling its tile stays a box. On success the
      * mask is slot sPropCount - 1. */
-    /* mostly green art: leaves (a bush), not a post on grass */
-    auto leafyArt = [&](int x, int y) {
+    /* the object in mask slot `slot` is mostly green: leaves (a bush), not a
+     * post standing on grass */
+    auto leafyArt = [&](int x, int y, int slot) {
+        const int ox = (slot % 16) * 16, oy = (slot / 16) * 16;
         int g = 0, all = 0;
-        for (int i = 0; i < 256; i += 2) {
+        for (int i = 0; i < 256; ++i) {
             const int c = BottomPixel(x, y, i & 15, i >> 4, bChar, b8 != 0);
-            if (c < 0)
+            if (c < 0 || !sMaskPixels[(oy + (i >> 4)) * 256 + ox + (i & 15)])
                 continue;
             ++all;
             const int r = c & 31, gg = (c >> 5) & 31, b = (c >> 10) & 31;
@@ -1888,16 +1904,16 @@ void BuildMap(void) {
             std::fprintf(stderr, "[voxel-cut] %d,%d try cover %d foliage %d\n", x, y, Cover(x, y), (int)Foliage(x, y));
         if (!outdoors || Cover(x, y) || sPropCount >= kMaxProps)
             return false;
-        /* it stands on dry ground: a walkable, unsunk neighbour (rocks in a
-         * river stay as they are) */
+        /* it stands on dry land: walkable, unsunk ground within two tiles
+         * (rocks out in a river stay as they are) */
         {
             bool dry = false;
-            static const int kNb3[4][2] = { { -1, 0 }, { 1, 0 }, { 0, 1 }, { 0, -1 } };
-            for (const auto& d : kNb3) {
-                const int nx = x + d[0], ny = y + d[1];
-                dry |= inRoom(nx, ny) && !Geom(nx, ny) && SinkDepth(nx, ny) == 0.0f &&
-                       gMapBottom.collisionData[ny * 64 + nx] == 0;
-            }
+            for (int dy = -2; dy <= 2 && !dry; ++dy)
+                for (int dx = -2; dx <= 2 && !dry; ++dx) {
+                    const int nx = x + dx, ny = y + dy;
+                    dry = (dx || dy) && inRoom(nx, ny) && !Geom(nx, ny) && SinkDepth(nx, ny) == 0.0f &&
+                          gMapBottom.collisionData[ny * 64 + nx] == 0;
+                }
             if (!dry)
                 return false;
         }
@@ -1919,20 +1935,28 @@ void BuildMap(void) {
                     addGround(x + dx, y + dy);
         if (groundX >= 0)
             addGround(groundX, groundY);
-        /* a fence along a cliff's top stands on the cliff's dirt */
-        if (inRoom(x, y + 1) && Geom(x, y + 1) && BottomTileType((y + 1) * 64 + x) != BottomTileType(y * 64 + x))
-            addGround(x, y + 1, true);
-        if (ng == 0)
-            return false;
         bool obj[256];
         int col[256], count = 0;
-        for (int i = 0; i < 256; ++i) {
-            const int c = col[i] = BottomPixel(x, y, i & 15, i >> 4, bChar, b8 != 0);
-            obj[i] = c >= 0 && std::find(ground, ground + ng, c) == ground + ng;
+        auto measure = [&]() {
+            count = 0;
+            for (int i = 0; i < 256; ++i) {
+                const int c = col[i] = BottomPixel(x, y, i & 15, i >> 4, bChar, b8 != 0);
+                obj[i] = c >= 0 && std::find(ground, ground + ng, c) == ground + ng;
+            }
+            DropShadowMass(obj, col);
+            for (int i = 0; i < 256; ++i)
+                count += obj[i];
+        };
+        if (ng == 0)
+            return false;
+        measure();
+        /* mostly not grass: maybe a fence along a cliff's top, standing on
+         * the cliff's dirt */
+        if (count > 210 && inRoom(x, y + 1) && Geom(x, y + 1) &&
+            BottomTileType((y + 1) * 64 + x) != BottomTileType(y * 64 + x)) {
+            addGround(x, y + 1, true);
+            measure();
         }
-        DropShadowMass(obj, col);
-        for (int i = 0; i < 256; ++i)
-            count += obj[i];
         if (std::getenv("TMC_VOXEL_DUMPMAP"))
             std::fprintf(stderr, "[voxel-cut] %d,%d ground colours %d object %d\n", x, y, ng, count);
         if (count < 24 || count > 210)
@@ -1958,7 +1982,8 @@ void BuildMap(void) {
             if (joins(x, y, x, y - 1) || joins(x, y, x, y + 1) || joins(x, y, x - 1, y) || joins(x, y, x + 1, y)) {
                 if (Cover(x, y) || !outdoors)
                     return false;
-                if (Foliage(x, y) && leafyArt(x, y) && BuildPropMask(x, y, sPropCount, bChar, b8 != 0)) {
+                if (Foliage(x, y) && BuildPropMask(x, y, sPropCount, bChar, b8 != 0) &&
+                    leafyArt(x, y, sPropCount)) {
                     sPropOutlined[sPropCount] = true;
                     ++sPropCount;
                     return true;
