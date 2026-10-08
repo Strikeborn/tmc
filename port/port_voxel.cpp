@@ -313,7 +313,8 @@ SDL_GPUTransferBuffer* sMapXfer = nullptr;
 Vert sVerts[kMaxVerts];
 /* Room geometry: up to ~4 quads per tile (floor/underlay, top, wall, sides)
  * plus the 24-tile edge margin around a 64x64 room. */
-constexpr int kMaxMapVerts = (64 * 64 * 8 + 112 * 112 * 2) * 6;
+/* tiles and margin, plus room for voxel props (a bush is ~800 faces) */
+constexpr int kMaxMapVerts = (64 * 64 * 8 + 112 * 112 * 2) * 6 + 1000000;
 Vert sMapVerts[kMaxMapVerts];
 int sMapVertCount = 0;
 Uint64 sMapKey = 0;
@@ -814,20 +815,33 @@ bool BuildPropMask(int x, int y, int slot, Uint32 charBase, bool bpp8) {
  * a differently arranged grass background still reads as ground. Fails when
  * that is most of the tile (not an object on that ground) or too little to
  * see. */
-bool BuildDiffMask(int x, int y, int ux, int uy, int slot, Uint32 charBase, bool bpp8) {
+bool BuildDiffMask(int x, int y, int ux, int uy, int slot, Uint32 charBase, bool bpp8, int* outCount = nullptr) {
     int ground[256], ng = 0;
     for (int i = 0; i < 256; ++i) {
         const int c = BottomPixel(ux, uy, i & 15, i >> 4, charBase, bpp8);
         if (std::find(ground, ground + ng, c) == ground + ng)
             ground[ng++] = c;
     }
+    /* A cast shadow is the ground's own green, darker than any ground
+     * pixel: it lies on the ground, it isn't part of the object. */
+    auto bright = [](int c) { return std::max(c & 31, std::max((c >> 5) & 31, (c >> 10) & 31)); };
+    int groundDark = 31;
+    for (int k = 0; k < ng; ++k)
+        if (ground[k] >= 0)
+            groundDark = std::min(groundDark, bright(ground[k]));
+    auto shadow = [&](int c) {
+        const int r = c & 31, g = (c >> 5) & 31, b = (c >> 10) & 31;
+        return g > r && g > b && bright(c) < groundDark && !Dark555(c);
+    };
     bool obj[256];
     int count = 0;
     for (int i = 0; i < 256; ++i) {
         const int c = BottomPixel(x, y, i & 15, i >> 4, charBase, bpp8);
-        obj[i] = std::find(ground, ground + ng, c) == ground + ng;
+        obj[i] = std::find(ground, ground + ng, c) == ground + ng && !shadow(c);
         count += obj[i];
     }
+    if (outCount)
+        *outCount = count;
     if (count < 24 || count > 200)
         return false;
     const int ox = (slot % 16) * 16, oy = (slot / 16) * 16;
@@ -1129,6 +1143,100 @@ void BuildMap(void) {
             r0 = r1;
         }
     };
+    /* A prop as a real voxel model: each art row is spun round the tile's
+     * centre into a disc as wide as the row (a trunk becomes a post, leaves a
+     * ball), in 2-px voxels. Every voxel wears the art pixel at the
+     * same distance out from the centre on its side, so the picture reads the
+     * same from any angle. Only faces with no neighbour are drawn. */
+    auto voxelProp = [&](int x, int y, Uint32 slot) {
+        const int ox = (int)((slot - 1) % 16) * 16, oy = (int)((slot - 1) / 16) * 16;
+        auto on = [&](int c, int r) {
+            return c >= 0 && c < 16 && r >= 0 && r < 16 && sMaskPixels[(oy + r) * 256 + ox + c] != 0;
+        };
+        /* 2-px voxels (8 per side): a voxel covers art rows 2k, 2k+1 */
+        constexpr int V = 2, G = 16 / V;
+        float radius[G];
+        for (int k = 0; k < G; ++k) {
+            radius[k] = -1.0f;
+            for (int r = k * V; r < k * V + V; ++r)
+                for (int c = 0; c < 16; ++c)
+                    if (on(c, r))
+                        radius[k] = std::max(radius[k], std::fabs(c + 0.5f - 8.0f));
+        }
+        /* Art column at distance d out on this voxel's side. */
+        auto column = [&](int vx, int vz, int& side) {
+            const float d = std::hypot((vx + 0.5f) * V - 8.0f, (vz + 0.5f) * V - 8.0f);
+            side = (vx + 0.5f) * V >= 8.0f ? 1 : -1;
+            return std::clamp((int)std::floor(8.0f + side * d), 0, 15);
+        };
+        /* A voxel exists where the art has a pixel at that distance from the
+         * centre on that side: a trunk stays a post, sparse branches become
+         * rings and spokes, not solid plates. Outlined (round) props fill. */
+        const bool fillRows = sPropOutlined[slot - 1];
+        static bool occ[G][G][G]; /* [row][vx][vz] */
+        for (int k = 0; k < G; ++k)
+            for (int vx = 0; vx < G; ++vx)
+                for (int vz = 0; vz < G; ++vz) {
+                    int side;
+                    const int c = column(vx, vz, side);
+                    const float d = std::hypot((vx + 0.5f) * V - 8.0f, (vz + 0.5f) * V - 8.0f);
+                    bool art = false;
+                    for (int r = k * V; r < k * V + V && !art; ++r)
+                        for (int dc = 0; dc < V && !art; ++dc)
+                            art = on(c - side * dc, r);
+                    occ[k][vx][vz] = radius[k] >= 0.0f && d <= radius[k] + V * 0.5f && (fillRows || art);
+                }
+        auto at = [&](int k, int vx, int vz) {
+            return k >= 0 && k < G && vx >= 0 && vx < G && vz >= 0 && vz < G && occ[k][vx][vz];
+        };
+        const Uint32 params = baseParams(0, 0);
+        const float x0 = x * 16.0f, z0 = y * 16.0f;
+        for (int k = 0; k < G; ++k)
+            for (int vx = 0; vx < G; ++vx)
+                for (int vz = 0; vz < G; ++vz) {
+                    if (!occ[k][vx][vz])
+                        continue;
+                    /* colour: the art pixel this far out on this side (upper row
+                     * first), falling back toward the centre to one the art has */
+                    int side;
+                    int c = column(vx, vz, side);
+                    int r = k * V;
+                    if (!on(c, r) && on(c, r + 1))
+                        ++r;
+                    while (!on(c, r) && c != (side > 0 ? 7 : 8))
+                        c -= side;
+                    const float u = x0 + c + 0.5f, v = z0 + r + 0.5f;
+                    const float px = x0 + vx * V, pz = z0 + vz * V, top = 16.0f - k * V, bot = top - V;
+                    const float px1 = px + V, pz1 = pz + V;
+                    auto face = [&](const float (&q)[4][3]) {
+                        Quad(sMapVerts, kMaxMapVerts, n, q, u, v, u, v, 0, 0u, bChar, params);
+                    };
+                    if (!at(k - 1, vx, vz)) {
+                        const float q[4][3] = { { px, top, pz }, { px1, top, pz }, { px, top, pz1 }, { px1, top, pz1 } };
+                        face(q);
+                    }
+                    if (!at(k + 1, vx, vz) && k < G - 1) {
+                        const float q[4][3] = { { px, bot, pz1 }, { px1, bot, pz1 }, { px, bot, pz }, { px1, bot, pz } };
+                        face(q);
+                    }
+                    if (!at(k, vx, vz + 1)) {
+                        const float q[4][3] = { { px, top, pz1 }, { px1, top, pz1 }, { px, bot, pz1 }, { px1, bot, pz1 } };
+                        face(q);
+                    }
+                    if (!at(k, vx, vz - 1)) {
+                        const float q[4][3] = { { px1, top, pz }, { px, top, pz }, { px1, bot, pz }, { px, bot, pz } };
+                        face(q);
+                    }
+                    if (!at(k, vx - 1, vz)) {
+                        const float q[4][3] = { { px, top, pz }, { px, top, pz1 }, { px, bot, pz }, { px, bot, pz1 } };
+                        face(q);
+                    }
+                    if (!at(k, vx + 1, vz)) {
+                        const float q[4][3] = { { px1, top, pz1 }, { px1, top, pz }, { px1, bot, pz1 }, { px1, bot, pz } };
+                        face(q);
+                    }
+                }
+    };
     /* Vertical lip of a sunk tile along one edge, heights d..0. */
     auto lip = [&](int x, int y, int edge, float d) {
         const float x0 = x * 16.0f, x1 = x0 + 16, z0 = y * 16.0f, z1 = z0 + 16;
@@ -1188,8 +1296,7 @@ void BuildMap(void) {
         if (!sPropOutlined[sPropCount]) {
             /* Open outline: the object is what differs from the ground it was
              * painted over. Grass comes in variants, so try every walkable
-             * neighbour and the room's commonest ground; the first that leaves a
-             * plausible object wins. */
+             * neighbour and the room's commonest ground. */
             static const int kNb[4][2] = { { 0, 1 }, { -1, 0 }, { 1, 0 }, { 0, -1 } };
             int cand[5][2], nc = 0;
             for (const auto& d : kNb) {
@@ -1199,10 +1306,15 @@ void BuildMap(void) {
             }
             if (groundX >= 0)
                 cand[nc][0] = groundX, cand[nc][1] = groundY, ++nc;
-            int c = 0;
-            while (c < nc && !BuildDiffMask(x, y, cand[c][0], cand[c][1], sPropCount, bChar, b8 != 0))
-                ++c;
-            if (c == nc)
+            /* the ground that leaves the smallest object is the one it stands on */
+            int best = -1, bestCount = 1 << 30;
+            for (int c = 0; c < nc; ++c) {
+                int count = 1 << 30;
+                if (BuildDiffMask(x, y, cand[c][0], cand[c][1], sPropCount, bChar, b8 != 0, &count) &&
+                    count < bestCount)
+                    bestCount = count, best = c;
+            }
+            if (best < 0 || !BuildDiffMask(x, y, cand[best][0], cand[best][1], sPropCount, bChar, b8 != 0))
                 return false;
         }
         ++sPropCount;
@@ -1309,6 +1421,18 @@ void BuildMap(void) {
                 }
                 std::fputc('\n', f);
             }
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x)
+                    if (kind[y * 64 + x] == 1) {
+                        const Uint32 slot = propSlot[y * 64 + x] - 1;
+                        const int ox = (int)(slot % 16) * 16, oy = (int)(slot / 16) * 16;
+                        std::fprintf(f, "prop %d,%d (%s)\n", x, y, sPropOutlined[slot] ? "outline" : "ground colours");
+                        for (int r = 0; r < 16; ++r) {
+                            for (int c = 0; c < 16; ++c)
+                                std::fputc(sMaskPixels[(oy + r) * 256 + ox + c] ? '#' : '.', f);
+                            std::fputc('\n', f);
+                        }
+                    }
             std::fclose(f);
         }
     }
@@ -1320,7 +1444,7 @@ void BuildMap(void) {
             const int t = y * 64 + x;
             if (kind[t] == 1) {
                 underlay(x, y);
-                pillar(x, y, propSlot[t]);
+                voxelProp(x, y, propSlot[t]);
             } else if (kind[t] == 3) {
                 underlay(x, y);
                 flatV(x, y, 0.2f, y * 16.0f, y * 16.0f + 16, 0);
@@ -1481,6 +1605,9 @@ void BuildMap(void) {
             }
         }
     sMapVertCount = n;
+    if (std::getenv("TMC_VOXEL_DEBUG") || std::getenv("TMC_VOXEL_DUMPMAP"))
+        std::fprintf(stderr, "[voxel-dbg] room geometry: %d of %d vertices, %d props\n", n, kMaxMapVerts,
+                     sPropCount);
     sBuildShapes = nullptr;
 }
 
