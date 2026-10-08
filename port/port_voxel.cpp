@@ -759,6 +759,14 @@ int TileOverride(int t) {
 
 bool SolidTile(int x, int y) {
     const int t = y * 64 + x;
+    switch (gMapBottom.actTiles[t]) { /* stairs and grades are walked on, whatever their collision */
+        case 0x26:
+        case 0x27:
+        case 0x34:
+            return false;
+        default:
+            break;
+    }
     const int ov = TileOverride(t);
     if (ov != PORT_VOXEL_SHAPE_AUTO)
         return ov != PORT_VOXEL_SHAPE_FLOOR;
@@ -3150,7 +3158,13 @@ void BuildMap(void) {
                     ++yb2;
                 const float hUp = inRoom(x, y - 1) ? terr[t - 64] : terr[t];
                 const float hLow = inRoom(x, yb2 + 1) ? terr[(yb2 + 1) * 64 + x] : terr[yb2 * 64 + x];
-                const float zA = y * 16.0f + hUp, zB = (yb2 + 1) * 16.0f + hLow; /* north and south ends */
+                /* north and south ends; the GBA draws a climb of R in R screen
+                 * rows, so a short run up a tall cliff has no depth once each end
+                 * shifts south by its height (a wall wearing steps): give it
+                 * depth of at least 3/4 its climb, running out onto the lower
+                 * ground from the upper ground's edge */
+                const float zA = y * 16.0f + hUp;
+                const float zB = zA + std::max((yb2 + 1) * 16.0f + hLow - zA, std::fabs(hUp - hLow) * 0.75f);
                 const float vA = y * 16.0f, vB = (yb2 + 1) * 16.0f;                  /* the run's art rows */
                 const int steps = std::max(1, (int)std::lround(std::fabs(hUp - hLow) / 4.0f));
                 const float x0 = x * 16.0f, x1 = x0 + 16;
@@ -3559,9 +3573,9 @@ void BuildMap(void) {
                 }
                 return BottomPixel(tx, ty, px & 15, py & 15, bChar, b8 != 0);
             };
-            auto straw = [](int c) {
+            auto straw = [](int c) { /* bright yellow-orange, not bark or dirt */
                 const int r = c & 31, g = (c >> 5) & 31, b = (c >> 10) & 31;
-                return c >= 0 && r >= 18 && g >= 10 && b < 12 && r > b + 8;
+                return c >= 0 && r >= 22 && g >= 14 && b < 14 && r > b + 10;
             };
             int warm = 0, all = 0;
             for (int py = yt * 16; py < (yb + 1) * 16; py += 2)
