@@ -888,6 +888,8 @@ Uint64 MapKey(void) {
  * never-shown filler), both layers where it's partial, the ground layer
  * otherwise. Overhead art overhanging walkable tiles next to a solid object
  * (a canopy's top rows) belongs to that object. */
+bool WriteRgbaPng(const char* path, const Uint8* rgba, int w, int h);
+
 void BuildMap(void) {
     int n = 0;
     sBuildShapes = CurrentShapes();
@@ -1148,88 +1150,124 @@ void BuildMap(void) {
      * ball). Every voxel wears the art pixel at the
      * same distance out from the centre on its side, so the picture reads the
      * same from any angle. Only faces with no neighbour are drawn. */
-    int thinProps = 0; /* props cut from their ground in this room (set before pass 2) */
     auto voxelProp = [&](int x, int y, Uint32 slot) {
         const int ox = (int)((slot - 1) % 16) * 16, oy = (int)((slot - 1) / 16) * 16;
         auto on = [&](int c, int r) {
             return c >= 0 && c < 16 && r >= 0 && r < 16 && sMaskPixels[(oy + r) * 256 + ox + c] != 0;
         };
-        /* Round props whose outline closes them in (bushes, pots) fill solid
-         * in 2-px voxels; props cut from their ground (saplings) keep their
-         * sparse shape in 1-px voxels (there are few of them). */
-        const bool round = sPropOutlined[slot - 1];
-        const int V = round || thinProps > 24 ? 2 : 1, G = 16 / V; /* 1 px only while they're few */
-        float radius[16];
-        for (int k = 0; k < G; ++k) {
-            radius[k] = -1.0f;
-            for (int r = k * V; r < k * V + V; ++r)
+        auto pix = [&](int c, int r) { return BottomPixel(x, y, c, r, bChar, b8 != 0); };
+        auto brown = [&](int p) { return p >= 0 && (p & 31) > ((p >> 5) & 31); }; /* red over green: soil, wood */
+        /* Every voxel remembers the art pixel it wears. */
+        static Sint8 srcC[16][16][16], srcR[16][16][16]; /* [row][vx][vz], -1 = empty */
+        std::memset(srcC, -1, sizeof(srcC));
+        /* A sapling stands on a narrow trunk: its rows' runs through the
+         * centre are mostly thin. Anything else is built as a round plant. */
+        int runW[16], nr = 0;
+        for (int r = 0; r < 16; ++r)
+            for (int c0 : { 7, 8, 6, 9 })
+                if (on(c0, r)) {
+                    int l = c0, rr = c0;
+                    while (on(l - 1, r))
+                        --l;
+                    while (on(rr + 1, r))
+                        ++rr;
+                    runW[nr++] = rr - l + 1;
+                    break;
+                }
+        std::sort(runW, runW + nr);
+        const bool round = sPropOutlined[slot - 1] || nr == 0 || runW[nr / 2] > 6;
+        int V = 1;
+        if (round) {
+            /* A plant its outline closes in (garden plants, bushes, pots): a
+             * solid ball in 2-px voxels, each row a disc as wide as the row.
+             * Leafy art leaves out the brown soil framing it. */
+            int green = 0, all = 0;
+            for (int r = 0; r < 16; ++r)
                 for (int c = 0; c < 16; ++c)
                     if (on(c, r))
-                        radius[k] = std::max(radius[k], std::fabs(c + 0.5f - 8.0f));
-        }
-        /* Art column at distance d out on this voxel's side. */
-        auto column = [&](int vx, int vz, int& side) {
-            const float d = std::hypot((vx + 0.5f) * V - 8.0f, (vz + 0.5f) * V - 8.0f);
-            side = (vx + 0.5f) * V >= 8.0f ? 1 : -1;
-            return std::clamp((int)std::floor(8.0f + side * d), 0, 15);
-        };
-        /* A voxel exists where the art has a pixel at that distance from the
-         * centre on that side: a trunk stays a post, sparse branches become
-         * rings and spokes, not solid plates. Round props fill. */
-        static bool occ[16][16][16]; /* [row][vx][vz] */
-        for (int k = 0; k < G; ++k)
-            for (int vx = 0; vx < G; ++vx)
-                for (int vz = 0; vz < G; ++vz) {
-                    int side;
-                    const int c = column(vx, vz, side);
-                    const float d = std::hypot((vx + 0.5f) * V - 8.0f, (vz + 0.5f) * V - 8.0f);
-                    bool art = false;
-                    for (int r = k * V; r < k * V + V && !art; ++r)
-                        for (int dc = 0; dc < V && !art; ++dc)
-                            art = on(c - side * dc, r);
-                    occ[k][vx][vz] = radius[k] >= 0.0f && d <= radius[k] + V * 0.5f && (round || art);
+                        ++all, green += !brown(pix(c, r));
+            const bool leafy = green * 2 > all;
+            auto keep = [&](int c, int r) {
+                const int p = pix(c, r);
+                return on(c, r) && !(leafy && (brown(p) || Dark555(p))); /* no soil or black outline ring */
+            };
+            V = 2;
+            for (int k = 0; k < 8; ++k) {
+                float rad = -1.0f;
+                for (int r = k * 2; r < k * 2 + 2; ++r)
+                    for (int c = 0; c < 16; ++c)
+                        if (keep(c, r))
+                            rad = std::max(rad, std::fabs(c + 0.5f - 8.0f));
+                if (rad < 0.0f)
+                    continue;
+                for (int vx = 0; vx < 8; ++vx)
+                    for (int vz = 0; vz < 8; ++vz) {
+                        const float d = std::hypot(vx * 2 + 1 - 8.0f, vz * 2 + 1 - 8.0f);
+                        if (d > rad + 1.0f)
+                            continue;
+                        /* the art pixel this far out on this side, from a row
+                         * that varies voxel to voxel (leaves read mottled) */
+                        const unsigned h = (unsigned)(vx * 73856093u ^ vz * 19349663u ^ k * 83492791u);
+                        const int side = vx * 2 + 1 >= 8 ? 1 : -1;
+                        int c = std::clamp((int)std::floor(8.0f + side * d), 0, 15), r = k * 2 + (int)(h % 2u);
+                        for (int tries = 0; !keep(c, r) && tries < 16; ++tries) {
+                            if (c != (side > 0 ? 7 : 8))
+                                c -= side;
+                            else
+                                r = r == k * 2 ? k * 2 + 1 : k * 2, c = std::clamp((int)std::floor(8.0f + side * d), 0, 15);
+                        }
+                        srcC[k][vx][vz] = (Sint8)c, srcR[k][vx][vz] = (Sint8)r;
+                    }
+            }
+        } else {
+            /* A small tree cut from its ground (a sapling: trunk, roots,
+             * a few leaves): the trunk -- each row's run of art through the
+             * centre -- is spun into a post that flares where the art does
+             * (the roots); everything off that run (stray leaves, root tips)
+             * stays a thin piece where the art has it, plus a copy turned a
+             * quarter, so it shows from every side without becoming a ring. */
+            for (int r = 0; r < 16; ++r) {
+                int l = -1, rr = -1;
+                for (int c0 : { 7, 8, 6, 9 })
+                    if (on(c0, r)) {
+                        l = rr = c0;
+                        break;
+                    }
+                if (l >= 0) {
+                    while (on(l - 1, r))
+                        --l;
+                    while (on(rr + 1, r))
+                        ++rr;
+                    const float rad = std::max(std::fabs(l + 0.5f - 8.0f), std::fabs(rr + 0.5f - 8.0f));
+                    for (int vx = 0; vx < 16; ++vx)
+                        for (int vz = 0; vz < 16; ++vz) {
+                            const float d = std::hypot(vx + 0.5f - 8.0f, vz + 0.5f - 8.0f);
+                            if (d > rad + 0.5f)
+                                continue;
+                            const int side = vx >= 8 ? 1 : -1;
+                            const int c = std::clamp((int)std::floor(8.0f + side * d), l, rr);
+                            srcC[r][vx][vz] = (Sint8)c, srcR[r][vx][vz] = (Sint8)r;
+                        }
                 }
+                for (int c = 0; c < 16; ++c)
+                    if (on(c, r) && (l < 0 || c < l || c > rr)) {
+                        srcC[r][c][7] = srcC[r][c][8] = (Sint8)c, srcR[r][c][7] = srcR[r][c][8] = (Sint8)r;
+                        srcC[r][7][c] = srcC[r][8][c] = (Sint8)c, srcR[r][7][c] = srcR[r][8][c] = (Sint8)r;
+                    }
+            }
+        }
+        const int G = 16 / V;
         auto at = [&](int k, int vx, int vz) {
-            return k >= 0 && k < G && vx >= 0 && vx < G && vz >= 0 && vz < G && occ[k][vx][vz];
-        };
-        /* A leaf colour for a round prop: not the dark outline or the brown
-         * soil at its foot (those would ring it). */
-        auto leafy = [&](int c, int r) {
-            const int p = BottomPixel(x, y, c, r, bChar, b8 != 0);
-            return p >= 0 && !Dark555(p) && ((p >> 5) & 31) >= (p & 31);
+            return k >= 0 && k < G && vx >= 0 && vx < G && vz >= 0 && vz < G && srcC[k][vx][vz] >= 0;
         };
         const Uint32 params = baseParams(0, 0);
         const float x0 = x * 16.0f, z0 = y * 16.0f;
         for (int k = 0; k < G; ++k)
             for (int vx = 0; vx < G; ++vx)
                 for (int vz = 0; vz < G; ++vz) {
-                    if (!occ[k][vx][vz])
+                    if (srcC[k][vx][vz] < 0)
                         continue;
-                    /* colour: the art pixel this far out on this side, from a
-                     * row that varies voxel to voxel (leaves read mottled, not
-                     * in rings), falling back toward the centre */
-                    int side;
-                    const int c0 = column(vx, vz, side);
-                    const unsigned h = (unsigned)(vx * 73856093u ^ vz * 19349663u ^ k * 83492791u);
-                    const int jitter = round ? (int)(h % 3u) - 1 : 0;
-                    int cu = -1, rv = 0;
-                    for (int pass = 0; pass < 2 && cu < 0; ++pass)
-                        for (int j : { jitter, 0, -jitter }) {
-                            const int r = std::clamp(k * V + (V > 1 ? (int)(h >> 4) % V : 0) + j, 0, 15);
-                            for (int c = c0;; c -= side) {
-                                if (on(c, r) && (pass == 1 || !round || leafy(c, r))) {
-                                    cu = c, rv = r;
-                                    break;
-                                }
-                                if (c == (side > 0 ? 7 : 8))
-                                    break;
-                            }
-                            if (cu >= 0)
-                                break;
-                        }
-                    if (cu < 0)
-                        cu = c0, rv = k * V;
-                    const float u = x0 + cu + 0.5f, v = z0 + rv + 0.5f;
+                    const float u = x0 + srcC[k][vx][vz] + 0.5f, v = z0 + srcR[k][vx][vz] + 0.5f;
                     const float px = x0 + vx * V, pz = z0 + vz * V, top = 16.0f - k * V, bot = top - V;
                     const float px1 = px + V, pz1 = pz + V;
                     auto face = [&](const float (&q)[4][3]) {
@@ -1472,6 +1510,24 @@ void BuildMap(void) {
                         const Uint32 slot = propSlot[y * 64 + x] - 1;
                         const int ox = (int)(slot % 16) * 16, oy = (int)(slot / 16) * 16;
                         std::fprintf(f, "prop %d,%d (%s)\n", x, y, sPropOutlined[slot] ? "outline" : "ground colours");
+                        { /* the tile's art and its cut-out, side by side, 8x */
+                            static Uint8 px[128 * 256 * 4];
+                            for (int r = 0; r < 128; ++r)
+                                for (int c = 0; c < 256; ++c) {
+                                    const int tx = (c % 128) / 8, ty = r / 8;
+                                    const int p = BottomPixel(x, y, tx, ty, bChar, b8 != 0);
+                                    const bool m = sMaskPixels[(oy + ty) * 256 + ox + tx] != 0;
+                                    Uint8* d = &px[(r * 256 + c) * 4];
+                                    const bool show = p >= 0 && (c < 128 || m);
+                                    d[0] = show ? (Uint8)((p & 31) * 255 / 31) : 40;
+                                    d[1] = show ? (Uint8)(((p >> 5) & 31) * 255 / 31) : 40;
+                                    d[2] = show ? (Uint8)(((p >> 10) & 31) * 255 / 31) : 40;
+                                    d[3] = 255;
+                                }
+                            char path[1024];
+                            std::snprintf(path, sizeof(path), "%s.prop_%d_%d.png", dumpPath, x, y);
+                            WriteRgbaPng(path, px, 256, 128);
+                        }
                         for (int r = 0; r < 16; ++r) {
                             for (int c = 0; c < 16; ++c)
                                 std::fputc(sMaskPixels[(oy + r) * 256 + ox + c] ? '#' : '.', f);
@@ -1482,9 +1538,6 @@ void BuildMap(void) {
         }
     }
     auto hAt = [&](int x, int b) { return inRoom(x, b) ? hmap[b * 64 + x] : 0.0f; };
-
-    for (int i = 0; i < sPropCount; ++i)
-        thinProps += !sPropOutlined[i];
 
     /* ---- pass 2: draw ---- */
     for (int y = 0; y < H; ++y)
