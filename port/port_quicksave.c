@@ -1012,7 +1012,7 @@ void Port_QuickSave_AutoTick(void) {
          * from the title screen, as the menu's resume does (crash repros). */
         static int titleFrames = 0, done = 0, after = 0;
         const char* ls = getenv("TMC_REPRO_LOAD_SLOT");
-        if (ls && *ls && !done && gMain.task == TASK_TITLE && ++titleFrames > 90) {
+        if (ls && *ls && !done && gMain.task == TASK_TITLE && ++titleFrames > 2) {
             done = 1;
             fprintf(stderr, "[quicksave] repro: loading slot %d from title -> %d\n", atoi(ls),
                     Port_QuickSave_LoadSlot(atoi(ls)));
