@@ -967,6 +967,32 @@ void BuildMap(void) {
         maskCache[key] = m;
         return m;
     };
+    /* Overhang pulled into an object (a canopy's edge over walkable ground):
+     * only the overhead art's own opaque pixels belong to the object, so the
+     * box is cut to them and the real ground shows through the rest, instead
+     * of the ground tile under the canopy edge standing up as part of it. */
+    std::map<Uint64, Uint32> coverCache;
+    auto coverMask = [&](int x, int y) -> Uint32 {
+        const u16* ts = &gMapDataTopSpecial[y * 2 * 128 + x * 2];
+        const Uint64 key = ((Uint64)ts[0] << 48) | ((Uint64)ts[1] << 32) | ((Uint64)ts[128] << 16) | ts[129];
+        const auto it = coverCache.find(key);
+        if (it != coverCache.end())
+            return it->second;
+        Uint32 m = 0;
+        if (sPropCount < kMaxProps) {
+            const int ox = (sPropCount % 16) * 16, oy = (sPropCount / 16) * 16;
+            int count = 0;
+            for (int i = 0; i < 256; ++i) {
+                const bool on = TopIndex(x, y, i & 15, i >> 4, tChar, t8 != 0) >= 0;
+                sMaskPixels[(oy + (i >> 4)) * 256 + ox + (i & 15)] = on ? 255 : 0;
+                count += on;
+            }
+            if (count >= 8)
+                m = (Uint32)++sPropCount;
+        }
+        coverCache[key] = m;
+        return m;
+    };
     /* The room's commonest walkable ground tile: underlay where no walkable
      * neighbour exists (the middle of a forest). */
     int groundX = -1, groundY = -1;
@@ -1234,12 +1260,27 @@ void BuildMap(void) {
         bool anyMask = false;
         if (outdoors && !rn.ledge)
             for (int r = yt; r <= yb; ++r)
-                anyMask |= (rowMask[r] = Foliage(x, r) ? silhouette(x, r) : 0u) != 0;
+                anyMask |= (rowMask[r] = geom[r * 64 + x] == 2 ? coverMask(x, r)
+                                         : Foliage(x, r)       ? silhouette(x, r)
+                                                               : 0u) != 0;
         /* Ground where it can be seen: behind the footprint, and wherever
          * silhouettes are cut. */
-        for (int r = yt; r <= yb; ++r)
-            if (anyMask || r < rn.foot)
-                underlay(x, r);
+        for (int r = yt; r <= yb; ++r) {
+            if (!anyMask && r >= rn.foot)
+                continue;
+            if (r < rn.foot) {
+                /* Behind the footprint the 2D art has no ground (the object
+                 * covered it): continue the ground north of the object. */
+                int uy = yt - 1;
+                while (uy >= 0 && Geom(x, uy))
+                    --uy;
+                if (uy >= 0 && Cover(x, uy) < 2 && SinkDepth(x, uy) == 0.0f) {
+                    flatL(false, x, x, uy, 0.0f, r * 16.0f, r * 16.0f + 16, 0);
+                    continue;
+                }
+            }
+            underlay(x, r);
+        }
 
         /* The run's dominant visible material: fill for see-through texels
          * on every box surface (top, front, sides). */
