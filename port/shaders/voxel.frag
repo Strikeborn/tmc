@@ -80,6 +80,18 @@ float fadeKeep() {
     return mix(1.0, uFade.x, w);
 }
 
+// Light from above and a little front-left: tops keep the GBA's own colours,
+// south faces ~82%, west ~74%, east and north 55%, so walls and voxel props
+// read as solid. The face's direction comes from its own screen derivatives,
+// turned toward the camera.
+float faceShade() {
+    vec3 n = normalize(cross(dFdx(vWorld), dFdy(vWorld)));
+    if (dot(n, uCam.xyz - vWorld) < 0.0)
+        n = -n;
+    const vec3 L = vec3(-0.35, 1.0, 0.55);
+    return clamp(0.6 + 0.4 * dot(n, L), 0.55, 1.0);
+}
+
 // 4x4 Bayer threshold: a thinned surface keeps a share of its pixels,
 // opaque, so depth stays right with no sorting (and it reads as pixel art).
 float bayer2(vec2 a) { a = floor(a); return fract(dot(a, vec2(0.5, a.y * 0.75))); }
@@ -95,7 +107,8 @@ void main() {
         if (keep < 1.0 && bayer4(gl_FragCoord.xy) >= keep)
             discard;
         uint entry = texelFetch(uMaps, ivec2(p.x >> 3, (p.y >> 3) + int(vParams.y)), 0).r;
-        // w: bit0 8bpp, bit1 fill-transparent, bits 8-16 prop mask slot+1, bits 20-27 fill palette index
+        // w: bit0 8bpp, bit1 fill-transparent, bits 8-16 prop mask slot+1, bits 20-27 fill palette index,
+        //    bit31 lit (room geometry: shaded by the way it faces)
         uint mslot = (vParams.w >> 8) & 511u;
         if (mslot != 0u) {
             mslot -= 1u;
@@ -134,5 +147,8 @@ void main() {
     }
     if (idx == 0u)
         discard;
-    oColor = vec4(texelFetch(uPal, ivec2(int(idx), 0), 0).rgb, 1.0);
+    vec3 rgb = texelFetch(uPal, ivec2(int(idx), 0), 0).rgb;
+    if (vParams.x == 0u && (vParams.w & 0x80000000u) != 0u)
+        rgb *= faceShade();
+    oColor = vec4(rgb, 1.0);
 }

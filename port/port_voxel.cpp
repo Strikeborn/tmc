@@ -1604,6 +1604,9 @@ void BuildMap(void) {
                 }
             }
         }
+    /* room geometry is shaded by the way each face points (voxel.frag) */
+    for (int i = 0; i < n; ++i)
+        sMapVerts[i].p[3] |= 0x80000000u;
     sMapVertCount = n;
     if (std::getenv("TMC_VOXEL_DEBUG") || std::getenv("TMC_VOXEL_DUMPMAP"))
         std::fprintf(stderr, "[voxel-dbg] room geometry: %d of %d vertices, %d props\n", n, kMaxMapVerts,
