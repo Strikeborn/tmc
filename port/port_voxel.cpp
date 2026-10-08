@@ -314,7 +314,7 @@ Vert sVerts[kMaxVerts];
 /* Room geometry: up to ~4 quads per tile (floor/underlay, top, wall, sides)
  * plus the 24-tile edge margin around a 64x64 room. */
 /* tiles and margin, plus room for voxel props (a bush is ~800 faces) */
-constexpr int kMaxMapVerts = (64 * 64 * 8 + 112 * 112 * 2) * 6 + 1000000;
+constexpr int kMaxMapVerts = (64 * 64 * 8 + 112 * 112 * 2) * 6 + 3000000; /* ~128 MB with props and trees */
 Vert sMapVerts[kMaxMapVerts];
 int sMapVertCount = 0;
 Uint64 sMapKey = 0;
@@ -1550,6 +1550,25 @@ void BuildMap(void) {
                                 treeOf[queue[i]] = (Uint8)trees.size();
                     }
                 }
+                /* Leaves no trunk claims (a tree whose trunk is hidden behind
+                 * others) form their own tree. */
+                {
+                    TreeObj o = { 64, 64, -1, -1 };
+                    int tiles = 0;
+                    for (int i = 0; i < qn; ++i)
+                        if (owner[i] < 0 && treeOf[queue[i]] == 254) {
+                            const int tx = queue[i] % 64, ty = queue[i] / 64;
+                            o.x0 = std::min(o.x0, tx), o.x1 = std::max(o.x1, tx);
+                            o.y0 = std::min(o.y0, ty), o.y1 = std::max(o.y1, ty);
+                            ++tiles;
+                        }
+                    if (tiles >= 4 && o.x1 - o.x0 < 8 && o.y1 - o.y0 < 6 && trees.size() < 250) {
+                        trees.push_back(o);
+                        for (int i = 0; i < qn; ++i)
+                            if (owner[i] < 0 && treeOf[queue[i]] == 254)
+                                treeOf[queue[i]] = (Uint8)trees.size();
+                    }
+                }
                 (void)trunks;
                 for (int i = 0; i < qn; ++i)
                     if (treeOf[queue[i]] == 254)
@@ -1736,15 +1755,14 @@ void BuildMap(void) {
             for (int tx = tr.x0; tx <= tr.x1; ++tx)
                 if (treeOf[ty * 64 + tx] == id && trunk[ty * 64 + tx])
                     tx0 = std::min(tx0, tx), tx1 = std::max(tx1, tx), trow = ty;
-        const float ground = (trow >= 0 ? trow + 1 : tr.y1 + 1) * 16.0f; /* where it stands */
-        const float zc = ground - 8.0f;
-        /* The leaves span rows = 2 depth + 2 height (screen row = z - h). A
-         * broad tree has a deep crown: depth follows its width, height takes
-         * what is left of the rows. */
-        const float rows = (float)(lbot - ltop + 1), xc = (lx0 + lx1 + 1) * 0.5f, rx = (lx1 - lx0 + 1) * 0.5f;
-        const float rz = std::clamp(std::max(rows / 4.0f, rx * 0.45f), 8.0f, 48.0f);
-        const float rh = std::clamp(rows / 2.0f - rz, 8.0f, 48.0f);
-        const float h0 = std::max(6.0f, zc + rz - (float)lbot); /* crown's underside */
+        /* The crown covers the tree's whole collision footprint (its tile
+         * rows), as wide as its leaves, a rounded body on the trunk; its top
+         * is the 2D tree laid over that footprint. */
+        const float trunkZ = (trow >= 0 ? trow : tr.y1) * 16.0f + 8.0f;
+        const float Z0 = (float)Y0, Z1 = (float)Y1, zc = (Z0 + Z1) * 0.5f, rz = (Z1 - Z0) * 0.5f;
+        const float xc = (lx0 + lx1 + 1) * 0.5f, rx = (lx1 - lx0 + 1) * 0.5f;
+        const float rh = std::clamp(std::min(rx, rz) * 0.8f, 12.0f, 36.0f);
+        const float h0 = 10.0f; /* crown's underside: over Link's head when he's beside it */
         const float hc = h0 + rh;
         const int NX = (int)std::ceil(2 * rx / V) + 1, NZ = (int)std::ceil(2 * rz / V) + 1,
                   NH = (int)std::ceil(2 * rh / V) + 1;
@@ -1765,7 +1783,15 @@ void BuildMap(void) {
         /* face colour: the art pixel the voxel lands on in the GBA's view */
         auto face = [&](const float (&q)[4][3], float px, float ph, float pz) {
             const int sx = (int)px;
+            /* crown: the art row at this depth across the footprint (lower
+             * faces toward the art's shaded bottom rows); trunk: the art the
+             * GBA's view puts there */
             int sy = (int)(pz - ph);
+            if (ph > h0 - 1.0f) {
+                const float t = std::clamp((pz - Z0) / (Z1 - Z0), 0.0f, 1.0f);
+                const float low = std::clamp(1.0f - (ph - h0) / (2.0f * rh), 0.0f, 1.0f) * 0.35f;
+                sy = (int)(ltop + (t + low * (1.0f - t)) * (lbot - ltop));
+            }
             /* crown voxels landing off the leaves (on a ledge behind) take the
              * nearest leaf pixel in their column */
             if (ph > h0 - 1.0f && !leaf(sx, sy))
@@ -1827,8 +1853,8 @@ void BuildMap(void) {
             const float tw = std::clamp((tx1 - tx0 + 1) * 16.0f / 3.0f, 6.0f, 20.0f);
             const float cx = (tx0 + tx1 + 1) * 8.0f;
             for (float h = 0.0f; h < h0 + 4.0f; h += V)
-                emitBox(cx - tw / 2, cx + tw / 2, h, h + V, zc - tw / 2, zc + tw / 2, false, false, true, true, true,
-                        true, cx, h + 1.0f, zc);
+                emitBox(cx - tw / 2, cx + tw / 2, h, h + V, trunkZ - tw / 2, trunkZ + tw / 2, false, false, true, true,
+                        true, true, cx, h + 1.0f, trunkZ);
         }
     };
 
