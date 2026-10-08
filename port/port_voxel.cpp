@@ -2403,7 +2403,8 @@ void BuildMap(void) {
             const int t = y * 64 + x;
             if (slopeV(x, y) || slopeH(x, y) || act(x, y) == 0x74 || CliffTile(x, y))
                 return false;
-            return !Geom(x, y) || kind[t] == 1 || kind[t] == 4 || kind[t] == 5;
+            (void)t; /* open floor only: objects on a rim would join the levels either side */
+            return !Geom(x, y);
         };
         for (int t = 0; t < 64 * 64; ++t)
             region[t] = -1, terr[t] = 0.0f;
@@ -2485,6 +2486,41 @@ void BuildMap(void) {
                     }
                 }
         }
+        /* areas an object cluster (a bush row, a tree) separates are one level
+         * unless cliffs say otherwise: weak votes for no difference */
+        {
+            static int ost[64 * 64];
+            static Uint8 oseen[64 * 64];
+            std::memset(oseen, 0, sizeof(oseen));
+            auto object = [&](int t) { return kind[t] == 1 || kind[t] == 4 || kind[t] == 5; };
+            for (int t0 = 0; t0 < 64 * 64; ++t0) {
+                if (oseen[t0] || !object(t0) || t0 % 64 >= W || t0 / 64 >= H)
+                    continue;
+                std::map<int, int> touch;
+                int sp = 0;
+                ost[sp++] = t0;
+                oseen[t0] = 1;
+                while (sp) {
+                    const int t = ost[--sp], tx = t % 64, ty = t / 64;
+                    static const int d[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+                    for (const auto& k : d) {
+                        const int nx = tx + k[0], ny = ty + k[1];
+                        if (!inRoom(nx, ny))
+                            continue;
+                        const int nt = ny * 64 + nx;
+                        if (region[nt] >= 0)
+                            ++touch[region[nt]];
+                        else if (object(nt) && !oseen[nt] && !CliffTile(nx, ny)) {
+                            oseen[nt] = 1;
+                            ost[sp++] = nt;
+                        }
+                    }
+                }
+                for (auto i = touch.begin(); i != touch.end(); ++i)
+                    for (auto j = std::next(i); j != touch.end(); ++j)
+                        votes[{ i->first, j->first }][0] += std::min(i->second, j->second);
+            }
+        }
         /* Each area is flat at one level. Every pair of areas takes the height
          * difference most of its votes agree on; from the biggest area (at
          * 0) levels spread along the best-supported pairs first. */
@@ -2534,9 +2570,38 @@ void BuildMap(void) {
         for (int t = 0; t < 64 * 64; ++t)
             if (region[t] >= 0)
                 terr[t] = rh[region[t]] - lowest;
+        /* objects (props, trees, shrubs) stand on the highest ground beside
+         * them, spreading through a tree's tiles */
+        {
+            static Uint8 done[64 * 64];
+            for (int t = 0; t < 64 * 64; ++t)
+                done[t] = region[t] >= 0;
+            auto object = [&](int t) { return kind[t] == 1 || kind[t] == 4 || kind[t] == 5; };
+            for (bool grew = true; grew;) {
+                grew = false;
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x) {
+                        const int t = y * 64 + x;
+                        if (done[t] == 1 || !object(t) || CliffTile(x, y))
+                            continue;
+                        float h = -1e9f;
+                        static const int d[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+                        for (const auto& k : d) {
+                            const int nx = x + k[0], ny = y + k[1];
+                            if (inRoom(nx, ny) && done[ny * 64 + nx] && (region[ny * 64 + nx] >= 0 || object(ny * 64 + nx)))
+                                h = std::max(h, terr[ny * 64 + nx]);
+                        }
+                        if (h > -1e8f && (!done[t] || h > terr[t] + 0.01f))
+                            terr[t] = h, done[t] = 2, grew = true;
+                    }
+            }
+        }
         /* stairs, grades, ledge lips: relaxed between the fixed levels round them */
         static float hf[64 * 64];
-        auto loose = [&](int x, int y) { return inField(x, y) && region[y * 64 + x] < 0; };
+        auto loose = [&](int x, int y) {
+            const int t = y * 64 + x;
+            return inField(x, y) && region[t] < 0 && kind[t] != 1 && kind[t] != 4 && kind[t] != 5;
+        };
         for (int it = 0; it < 400; ++it)
             for (int y = 0; y < H; ++y)
                 for (int x = 0; x < W; ++x) {
@@ -2612,6 +2677,17 @@ void BuildMap(void) {
                 line[W] = 0;
                 std::fprintf(stderr, "[voxel-area] %2d %s\n", y, line);
             }
+            for (int y = 0; y < H; ++y) {
+                char line[80];
+                for (int x = 0; x < W; ++x) {
+                    const int r = region[y * 64 + x];
+                    line[x] = r < 0 ? '.' : (char)(r < 10 ? '0' + r : r < 36 ? 'a' + r - 10 : 'A' + (r - 36) % 26);
+                }
+                line[W] = 0;
+                std::fprintf(stderr, "[voxel-reg] %2d %s\n", y, line);
+            }
+            for (const Link2& l : links)
+                std::fprintf(stderr, "[voxel-link] %d-%d dh %d n %d\n", l.a, l.b, l.dh, l.n);
             for (const Link2& l : links)
                 std::fprintf(stderr, "[voxel-terrain] area %d (%d tiles) - area %d (%d tiles) = %d (%d votes)\n", l.a,
                              regionSize[l.a], l.b, regionSize[l.b], l.dh, l.n);
@@ -3522,22 +3598,54 @@ void BuildMap(void) {
                     for (int e = 0; e < 2; ++e) {
                         if (!(e ? eastOpen : westOpen))
                             continue;
-                        const float xs = e ? x1 : x0, hm = std::max(h0, h1);
-                        const float g[4][3] = { { xs, hm, za }, { xs, hm, z }, { xs, 0, za }, { xs, 0, z } };
-                        strip(g, vOf((z + za) * 0.5f) - hm * 0.5f, vOf((z + za) * 0.5f), true, e ? x1 - 1.5f : x0 + 1.5f);
+                        const float xs = e ? x1 : x0, hm = std::max(h0, h1), ucol = e ? x1 - 4.5f : x0 + 4.5f;
+                        /* stone: the front band's rows, one per px of height */
+                        for (int k = 0; k < (int)hw; ++k) {
+                            const float g[4][3] = { { xs, k + 1.0f, za }, { xs, k + 1.0f, z }, { xs, (float)k, za }, { xs, (float)k, z } };
+                            const float v = (float)artRowAt(zF, k + 0.5f) + 0.5f;
+                            Quad(sMapVerts, kMaxMapVerts, n, g, ucol, v, ucol, v, 0, 0u, bChar, b8);
+                        }
+                        /* thatch: the eave row's straw up to the roof line */
+                        if (hm > hw + 0.5f) {
+                            const float g[4][3] = { { xs, hm, za }, { xs, hm, z }, { xs, hw, za }, { xs, hw, z } };
+                            const float v = vOf(zF - 0.5f) - 2.0f;
+                            Quad(sMapVerts, kMaxMapVerts, n, g, ucol, v - 3.0f, ucol, v, 0, 0u, bChar, b8);
+                        }
                     }
                 }
                 /* the back: a wall under the roof's rear eaves, the stone of the
                  * building's east end (no door there) */
                 {
-                    int ex = x;
-                    while (strawRun(ex + 1))
-                        ++ex;
-                    const float zb = zc - rz, ue = ex * 16.0f + 8.0f;
+                    /* this column's own front stone (bricks, windows), or, where
+                     * the door is (green or dark in the band), the nearest
+                     * column whose band is plain */
+                    auto plainBand = [&](int cx) {
+                        int bad = 0;
+                        for (int k = 0; k < (int)hw; ++k)
+                            for (int c = 0; c < 16; c += 2) {
+                                bool tp;
+                                const int v = visible(cx * 16 + c, artRowAt(zF, k + 0.5f), tp);
+                                const int r = v & 31, g = (v >> 5) & 31, b = (v >> 10) & 31;
+                                bad += v >= 0 && g > r + 3 && g > b + 3;
+                            }
+                        return bad < 3;
+                    };
+                    int sx = x;
+                    for (int d = 1; d < 8 && !plainBand(sx); ++d) {
+                        if (strawRun(x + d) && plainBand(x + d)) {
+                            sx = x + d;
+                            break;
+                        }
+                        if (strawRun(x - d) && plainBand(x - d)) {
+                            sx = x - d;
+                            break;
+                        }
+                    }
+                    const float zb = zc - rz;
                     for (int k = 0; k < (int)hw; ++k) {
                         const float c[4][3] = { { x1, k + 1.0f, zb }, { x0, k + 1.0f, zb }, { x1, (float)k, zb }, { x0, (float)k, zb } };
                         const float v = (float)artRowAt(zF, k + 0.5f) + 0.5f;
-                        Quad(sMapVerts, kMaxMapVerts, n, c, ue - 4.0f, v, ue + 4.0f, v, 0, 0u, bChar, b8);
+                        Quad(sMapVerts, kMaxMapVerts, n, c, sx * 16.0f + 16, v, sx * 16.0f, v, 0, 0u, bChar, b8);
                     }
                 }
                 /* ground round its back, where the art's roof covered it */
