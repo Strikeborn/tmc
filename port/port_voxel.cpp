@@ -64,6 +64,7 @@ int Port_Voxel_ViewTurn(void) {
 #include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <map>
 
 #include <nlohmann/json.hpp>
@@ -352,6 +353,10 @@ Vert sVerts[kMaxVerts];
 constexpr int kMaxMapVerts = (64 * 64 * 8 + 112 * 112 * 2) * 6 + 6000000; /* ~230 MB: a dense wood of voxel trees takes ~3.7M */
 Vert sMapVerts[kMaxMapVerts];
 int sMapVertCount = 0;
+/* Ground height (px) of each room tile from the terrain solve in BuildMap:
+ * raised areas, stairs; sprites stand on it. */
+float sTerrainH[64 * 64];
+int sTerrainW = 0, sTerrainHt = 0;
 Uint64 sMapKey = 0;
 constexpr int kMaskRows = 512; /* mask atlas: 256 x 512, 16 x 32 slots of 16 x 16 */
 constexpr int kMaxProps = 510;  /* params carry slot + 1 in 9 bits */
@@ -793,6 +798,13 @@ void TileCollisionRows(int x, int y, Uint16 rows[16]) {
         for (int c = 0; c < 16; ++c)
             if (IsTileCollision(gMapBottom.collisionData, ox + c, oy + r, 0))
                 rows[r] |= (Uint16)(1u << c);
+}
+
+/* A cliff's face or side (the game tags them for climbing NPCs): always a
+ * wall between levels, never a prop. */
+bool CliffTile(int x, int y) {
+    const int a = gMapBottom.actTiles[y * 64 + x];
+    return a >= 0x2a && a <= 0x2d;
 }
 
 /* Sunk surfaces: water sits a little below the ground so shorelines show a
@@ -1902,7 +1914,7 @@ void BuildMap(void) {
     auto tryCutout = [&](int x, int y) -> bool {
         if (std::getenv("TMC_VOXEL_DUMPMAP"))
             std::fprintf(stderr, "[voxel-cut] %d,%d try cover %d foliage %d\n", x, y, Cover(x, y), (int)Foliage(x, y));
-        if (!outdoors || Cover(x, y) || sPropCount >= kMaxProps)
+        if (!outdoors || Cover(x, y) || sPropCount >= kMaxProps || CliffTile(x, y))
             return false;
         /* it stands on dry land: walkable, unsunk ground within two tiles
          * (rocks out in a river stay as they are) */
@@ -1970,6 +1982,8 @@ void BuildMap(void) {
         return true;
     };
     auto isProp = [&](int x, int y) -> bool {
+        if (CliffTile(x, y))
+            return false;
         const int ov = TileOverride(y * 64 + x);
         if (ov == PORT_VOXEL_SHAPE_FLOOR || ov == PORT_VOXEL_SHAPE_BLOCK || sPropCount >= kMaxProps ||
             Cover(x, y) == 2)
@@ -2295,6 +2309,222 @@ void BuildMap(void) {
             for (int b = rn.foot; b <= yb; ++b) /* a floating canopy is no wall; a half one leaves a gap */
                 hmap[b * 64 + x] = rn.floating || HalfX(x, b) ? 0.0f : rn.topH;
             runs.push_back(rn);
+        }
+    }
+    /* ---- terrain: which areas stand higher ----
+     * The 2D map has no heights, but its walls and ledges say where they
+     * are. Walkable ground splits into areas at cliffs, ledges you hop down
+     * (SURFACE_EDGE) and stairs (ground-to-ground slopes). Every cliff column
+     * between two areas votes that the one north of it is higher by the
+     * cliff's height; a ledge votes its upper side (away from its solid half)
+     * a floor higher. From the biggest area at 0, heights spread along the
+     * best-supported votes. Boxes then stand on the area in front of them,
+     * floors and objects on their own, stairs climb between theirs. */
+    static int region[64 * 64];
+    static float terr[64 * 64];
+    std::vector<int> regionSize;
+    {
+        auto act = [&](int x, int y) { return gMapBottom.actTiles[y * 64 + x]; };
+        auto slopeV = [&](int x, int y) { return act(x, y) == 0x26 || act(x, y) == 0x34; }; /* stairs, grades */
+        auto slopeH = [&](int x, int y) { return act(x, y) == 0x27; };
+        auto ground = [&](int x, int y) {
+            if (!inRoom(x, y))
+                return false;
+            const int t = y * 64 + x;
+            if (slopeV(x, y) || slopeH(x, y) || act(x, y) == 0x74)
+                return false;
+            return !Geom(x, y) || kind[t] == 1 || kind[t] == 4;
+        };
+        for (int t = 0; t < 64 * 64; ++t)
+            region[t] = -1, terr[t] = 0.0f;
+        int nreg = 0;
+        static int stack[64 * 64];
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                if (region[y * 64 + x] >= 0 || !ground(x, y))
+                    continue;
+                int sp = 0, size = 0;
+                stack[sp++] = y * 64 + x;
+                region[y * 64 + x] = nreg;
+                while (sp) {
+                    const int t = stack[--sp], tx = t % 64, ty = t / 64;
+                    ++size;
+                    static const int d[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+                    for (const auto& k : d) {
+                        const int nx = tx + k[0], ny = ty + k[1];
+                        if (ground(nx, ny) && region[ny * 64 + nx] < 0) {
+                            region[ny * 64 + nx] = nreg;
+                            stack[sp++] = ny * 64 + nx;
+                        }
+                    }
+                }
+                regionSize.push_back(size);
+                ++nreg;
+            }
+        /* votes: (upper, lower, height) */
+        std::map<std::pair<int, int>, std::map<int, int>> votes;
+        auto vote = [&](int up, int low, int dh) {
+            if (up < 0 || low < 0 || up == low || dh <= 0)
+                return;
+            if (up < low)
+                ++votes[{ up, low }][dh];
+            else
+                ++votes[{ low, up }][-dh];
+        };
+        auto reg = [&](int x, int y) { return inRoom(x, y) ? region[y * 64 + x] : -1; };
+        if (outdoors) {
+            for (const Run& rn : runs)
+                if (!rn.floating && !rn.ledge)
+                    vote(reg(rn.x, rn.yt - 1), reg(rn.x, rn.yb + 1), (int)std::lround(rn.topH));
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    if (act(x, y) != 0x74)
+                        continue;
+                    switch (gMapBottom.collisionData[y * 64 + x]) {
+                        case 0x0C: /* solid north half: the drop is north, the upper side south */
+                            vote(reg(x, y + 1), reg(x, y - 1), 16);
+                            break;
+                        case 0x03:
+                            vote(reg(x, y - 1), reg(x, y + 1), 16);
+                            break;
+                        case 0x0A:
+                            vote(reg(x + 1, y), reg(x - 1, y), 16);
+                            break;
+                        case 0x05:
+                            vote(reg(x - 1, y), reg(x + 1, y), 16);
+                            break;
+                        default:
+                            break;
+                    }
+                }
+        }
+        /* Heights as a smooth field over the ground tiles: each cliff column
+         * wants the ground north of it higher than the ground south of it by
+         * the cliff's height (strongly); each ledge a floor (strongly); any
+         * two neighbouring ground tiles want to be level (weakly). Ground a
+         * cliff encloses stays up; where the game joins levels without a
+         * tagged slope (a grassy gap, open stairs) the field ramps. Solved
+         * by relaxation; the lowest ground ends at 0. */
+        auto inField = [&](int x, int y) {
+            if (!inRoom(x, y))
+                return false;
+            const int t = y * 64 + x;
+            return !Geom(x, y) || kind[t] == 1 || kind[t] == 4;
+        };
+        struct Pull {
+            int to;
+            float d, w; /* wants h[self] - h[to] = d, with weight w */
+        };
+        static std::vector<Pull> pulls[64 * 64];
+        for (int t = 0; t < 64 * 64; ++t)
+            pulls[t].clear();
+        auto pull = [&](int ax, int ay, int bx, int by, float d, float w) { /* h[a] - h[b] = d */
+            if (!inField(ax, ay) || !inField(bx, by))
+                return;
+            pulls[ay * 64 + ax].push_back({ by * 64 + bx, d, w });
+            pulls[by * 64 + bx].push_back({ ay * 64 + ax, -d, w });
+        };
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                pull(x, y, x + 1, y, 0.0f, 1.0f);
+                pull(x, y, x, y + 1, 0.0f, 1.0f);
+            }
+        int cliffCols = 0;
+        if (outdoors) {
+            /* only real cliffs (the game tags their tiles): a house or a wall
+             * has the same ground behind it as in front */
+            for (const Run& rn : runs) {
+                if (rn.floating || rn.ledge || !inField(rn.x, rn.yt - 1) || !inField(rn.x, rn.yb + 1))
+                    continue;
+                bool cliff = false;
+                for (int r = rn.yt; r <= rn.yb && !cliff; ++r)
+                    cliff = CliffTile(rn.x, r);
+                if (!cliff)
+                    continue;
+                pull(rn.x, rn.yt - 1, rn.x, rn.yb + 1, rn.topH, 40.0f);
+                ++cliffCols;
+            }
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    if (act(x, y) != 0x74)
+                        continue;
+                    switch (gMapBottom.collisionData[y * 64 + x]) { /* upper side away from the solid half */
+                        case 0x0C: pull(x, y + 1, x, y - 1, 16.0f, 40.0f); break;
+                        case 0x03: pull(x, y - 1, x, y + 1, 16.0f, 40.0f); break;
+                        case 0x0A: pull(x + 1, y, x - 1, y, 16.0f, 40.0f); break;
+                        case 0x05: pull(x - 1, y, x + 1, y, 16.0f, 40.0f); break;
+                        default: break;
+                    }
+                }
+        }
+        static float hf[64 * 64];
+        for (int t = 0; t < 64 * 64; ++t)
+            hf[t] = 0.0f;
+        if (cliffCols > 0)
+            for (int it = 0; it < 1500; ++it)
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x) {
+                        const int t = y * 64 + x;
+                        if (pulls[t].empty())
+                            continue;
+                        float sw = 0.0f, sv = 0.0f;
+                        for (const Pull& q : pulls[t])
+                            sw += q.w, sv += q.w * (hf[q.to] + q.d);
+                        hf[t] += 1.85f * (sv / sw - hf[t]); /* over-relaxed */
+                    }
+        float lowest = 1e9f;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x)
+                if (inField(x, y))
+                    lowest = std::min(lowest, hf[y * 64 + x]);
+        if (lowest > 1e8f)
+            lowest = 0.0f;
+        /* Ground stands on whole floors (16 px): areas lie flat and where
+         * the field crosses between floors the step is a wall. Stairs keep
+         * their in-between heights and climb. */
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x)
+                if (inField(x, y)) {
+                    const float v = hf[y * 64 + x] - lowest;
+                    terr[y * 64 + x] = slopeV(x, y) || slopeH(x, y) ? std::round(v * 0.5f) * 2.0f
+                                                                    : std::round(v / 16.0f) * 16.0f;
+                }
+        struct Link2 {
+            int a, b, dh, n;
+        };
+        std::vector<Link2> links;
+        /* boxes stand on the area in front of them (south), else behind */
+        for (const Run& rn : runs) {
+            float base = 0.0f;
+            if (inField(rn.x, rn.yb + 1))
+                base = terr[(rn.yb + 1) * 64 + rn.x];
+            else if (inField(rn.x, rn.yt - 1))
+                base = std::max(0.0f, terr[(rn.yt - 1) * 64 + rn.x] - rn.topH);
+            for (int r = rn.yt; r <= rn.yb; ++r)
+                terr[r * 64 + rn.x] = base;
+            for (int b = rn.foot; b <= rn.yb; ++b)
+                if (hmap[b * 64 + rn.x] > 0.0f)
+                    hmap[b * 64 + rn.x] += base;
+        }
+        for (int t = 0; t < 64 * 64; ++t)
+            if (kind[t] != 2)
+                hmap[t] = terr[t];
+        std::memcpy(sTerrainH, terr, sizeof(sTerrainH));
+        sTerrainW = W, sTerrainHt = H;
+        if (std::getenv("TMC_VOXEL_DUMPMAP")) {
+            std::fprintf(stderr, "[voxel-terrain] %d areas, %zu links\n", nreg, links.size());
+            for (int y = 0; y < H; ++y) {
+                char line[80];
+                for (int x = 0; x < W; ++x) {
+                    const int r = region[y * 64 + x];
+                    line[x] = r < 0 ? (CliffTile(x, y) ? '#' : '.') : (char)(r < 10 ? '0' + r : 'a' + (r - 10) % 26);
+                }
+                line[W] = 0;
+                std::fprintf(stderr, "[voxel-area] %2d %s\n", y, line);
+            }
+            for (const Link2& l : links)
+                std::fprintf(stderr, "[voxel-terrain] area %d (%d tiles) - area %d (%d tiles) = %d (%d votes)\n", l.a,
+                             regionSize[l.a], l.b, regionSize[l.b], l.dh, l.n);
         }
     }
     /* ponytail: debug knob — TMC_VOXEL_DUMPMAP=<file>: per-tile classification
@@ -2626,10 +2856,46 @@ void BuildMap(void) {
         }
     };
 
-    /* ---- pass 2: draw ---- */
+    /* ---- pass 2: draw ----
+     * Everything is built at ground 0 and lifted to its terrain height. */
+    auto liftFrom = [&](int n0, float dh) {
+        if (dh != 0.0f)
+            for (int i = n0; i < n; ++i)
+                sMapVerts[i].pos[1] += dh;
+    };
     for (int y = 0; y < H; ++y)
         for (int x = 0; x < W; ++x) {
             const int t = y * 64 + x;
+            const int n0 = n;
+            const bool stairV = (gMapBottom.actTiles[t] == 0x26 || gMapBottom.actTiles[t] == 0x34) && kind[t] == 0,
+                       stairH = gMapBottom.actTiles[t] == 0x27 && kind[t] == 0;
+            if (stairV || stairH) {
+                /* stairs: four steps across the tile, climbing between the
+                 * ground at the run's ends (heights interpolated per tile) */
+                const float hc = terr[t];
+                const float hPrev = stairV ? (inRoom(x, y + 1) ? terr[t + 64] : hc) : (inRoom(x - 1, y) ? terr[t - 1] : hc);
+                const float hNext = stairV ? (inRoom(x, y - 1) ? terr[t - 64] : hc) : (inRoom(x + 1, y) ? terr[t + 1] : hc);
+                const float h0 = (hPrev + hc) * 0.5f, h1 = (hc + hNext) * 0.5f;
+                for (int k = 0; k < 4; ++k) {
+                    const float hk = h0 + (h1 - h0) * (k + 1) / 4.0f, hkPrev = h0 + (h1 - h0) * k / 4.0f;
+                    if (stairV) { /* climbing north: step k from the south edge */
+                        const float z1 = y * 16.0f + 16 - k * 4.0f, z0 = z1 - 4.0f;
+                        flatL(false, x, x, y, hk, z0, z1, 0);
+                        const float c[4][3] = { { x * 16.0f, hk, z1 }, { x * 16.0f + 16, hk, z1 },
+                                                { x * 16.0f, hkPrev, z1 }, { x * 16.0f + 16, hkPrev, z1 } };
+                        Quad(sMapVerts, kMaxMapVerts, n, c, x * 16.0f, z0, x * 16.0f + 16, z1, 0, 0u, bChar, b8);
+                    } else { /* climbing east: step k from the west edge */
+                        const float x0 = x * 16.0f + k * 4.0f, x1 = x0 + 4.0f;
+                        const float c[4][3] = { { x0, hk, y * 16.0f }, { x1, hk, y * 16.0f },
+                                                { x0, hk, y * 16.0f + 16 }, { x1, hk, y * 16.0f + 16 } };
+                        Quad(sMapVerts, kMaxMapVerts, n, c, x0, y * 16.0f, x1, y * 16.0f + 16, 0, 0u, bChar, b8);
+                        const float r[4][3] = { { x0, hk, y * 16.0f + 16 }, { x0, hk, y * 16.0f },
+                                                { x0, hkPrev, y * 16.0f + 16 }, { x0, hkPrev, y * 16.0f } };
+                        Quad(sMapVerts, kMaxMapVerts, n, r, x0, y * 16.0f, x0 + 1, y * 16.0f + 16, 0, 0u, bChar, b8);
+                    }
+                }
+                continue;
+            }
             if (kind[t] == 1) {
                 underlay(x, y);
                 voxelProp(x, y, propSlot[t]);
@@ -2663,12 +2929,54 @@ void BuildMap(void) {
                               y * 16.0f + 16 + kTopLayerLift, 0);
                 }
             }
+            if (kind[t] != 2)
+                liftFrom(n0, terr[t]);
         }
-    for (size_t i = 0; i < trees.size(); ++i)
+    /* where neighbouring ground stands at different heights (an area's edge
+     * with no cliff box: a cliff's end, a raised path) a face closes the
+     * step, wearing the higher tile's art */
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const int t = y * 64 + x;
+            if (kind[t] == 2)
+                continue;
+            static const int d[4][2] = { { 0, 1 }, { 0, -1 }, { 1, 0 }, { -1, 0 } };
+            for (int e = 0; e < 4; ++e) {
+                const int nx = x + d[e][0], ny = y + d[e][1];
+                if (!inRoom(nx, ny))
+                    continue;
+                /* down to a box: to its top (a cliff top lower than this ground) */
+                const int nt = ny * 64 + nx;
+                const float lo = kind[nt] == 2 ? std::max(hmap[nt], terr[nt]) : terr[nt], hi = terr[t];
+                if (hi - lo < 1.0f)
+                    continue;
+                float c[4][3];
+                const float x0 = x * 16.0f, x1 = x0 + 16, z0 = y * 16.0f, z1 = z0 + 16;
+                if (e == 0) { const float q[4][3] = { { x0, hi, z1 }, { x1, hi, z1 }, { x0, lo, z1 }, { x1, lo, z1 } }; std::memcpy(c, q, sizeof c); }
+                else if (e == 1) { const float q[4][3] = { { x1, hi, z0 }, { x0, hi, z0 }, { x1, lo, z0 }, { x0, lo, z0 } }; std::memcpy(c, q, sizeof c); }
+                else if (e == 2) { const float q[4][3] = { { x1, hi, z1 }, { x1, hi, z0 }, { x1, lo, z1 }, { x1, lo, z0 } }; std::memcpy(c, q, sizeof c); }
+                else { const float q[4][3] = { { x0, hi, z0 }, { x0, hi, z1 }, { x0, lo, z0 }, { x0, lo, z1 } }; std::memcpy(c, q, sizeof c); }
+                Quad(sMapVerts, kMaxMapVerts, n, c, x0, z0, x1, z1, 0, 0u, bChar, b8);
+            }
+        }
+    for (size_t i = 0; i < trees.size(); ++i) {
+        const int n0 = n;
         treeVoxels(trees[i], (int)i + 1);
+        /* a tree stands on its lowest row's ground */
+        float h = 0.0f;
+        for (int x = trees[i].x0; x <= trees[i].x1; ++x)
+            h = std::max(h, terr[trees[i].y1 * 64 + x]);
+        liftFrom(n0, h);
+    }
     for (const Run& rn : runs) {
         const int x = rn.x, yt = rn.yt, yb = rn.yb, face = rn.face;
         const float topH = rn.topH, zFace = (yb + 1) * 16.0f;
+        const float base = terr[yb * 64 + x];
+        const int nRun = n;
+        struct LiftOnExit {
+            std::function<void()> f;
+            ~LiftOnExit() { f(); }
+        } liftRun{ [&, nRun, base]() { liftFrom(nRun, base); } };
         const bool thin = yb - yt + 1 <= face; /* all face: 8px-deep cap */
         /* a run of tiles all solid on the same half stands on that half */
         int hx = HalfX(x, yt);
@@ -2696,7 +3004,7 @@ void BuildMap(void) {
                 while (uy >= 0 && Geom(x, uy))
                     --uy;
                 if (uy >= 0 && Cover(x, uy) < 2 && SinkDepth(x, uy) == 0.0f) {
-                    flatL(false, x, x, uy, 0.0f, r * 16.0f, r * 16.0f + 16, 0);
+                    flatL(false, x, x, uy, terr[uy * 64 + x] - base, r * 16.0f, r * 16.0f + 16, 0);
                     continue;
                 }
             }
@@ -2753,11 +3061,11 @@ void BuildMap(void) {
                     }
             };
             int sx;
-            if ((hx || hAt(x - 1, b) < topH) && x > 0) {
+            if ((hx || hAt(x - 1, b) < base + topH) && x > 0) {
                 leafFrom(1, sx);
                 sideV(x, r, false, z0, z1, topH, (Uint32)fill, rowMask[r], -1.0f, sx, sx < 0 ? -1 : r);
             }
-            if ((hx || hAt(x + 1, b) < topH) && x < W - 1) {
+            if ((hx || hAt(x + 1, b) < base + topH) && x < W - 1) {
                 leafFrom(-1, sx);
                 sideV(x, r, true, z0, z1, topH, (Uint32)fill, rowMask[r], -1.0f, sx, sx < 0 ? -1 : r);
             }
@@ -3006,6 +3314,11 @@ static void GatherFadeActors(PortVoxelFade& f) {
         f.actors[n][0] = (float)(e.x.HALF.HI - gRoomControls.origin_x);
         f.actors[n][1] = std::max(0.0f, -(float)e.z.HALF.HI); /* z is up-negative */
         f.actors[n][2] = (float)(e.y.HALF.HI - gRoomControls.origin_y);
+        { /* standing on raised ground */
+            const int tx = (int)f.actors[n][0] >> 4, ty = (int)f.actors[n][2] >> 4;
+            if (tx >= 0 && ty >= 0 && tx < sTerrainW && ty < sTerrainHt)
+                f.actors[n][1] += sTerrainH[ty * 64 + tx];
+        }
         f.actors[n][3] = 0.0f;
         ++n;
     };
@@ -3167,7 +3480,13 @@ static bool PresentImpl(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swap, int swa
         }
         const float x0 = o.x + scrollX, x1 = x0 + o.w;
         const int sy0 = o.y, sy1 = sy0 + o.h;
-        const float elev = tag.layer == 2 ? kTopLayerLift : 0.0f;
+        float elev = tag.layer == 2 ? kTopLayerLift : 0.0f;
+        { /* the terrain under the entity's feet */
+            const int tx = (int)std::floor((tag.anchorX + scrollX) / 16.0f),
+                      ty = (int)std::floor((tag.groundY + scrollY - 1.0f) / 16.0f);
+            if (tx >= 0 && ty >= 0 && tx < sTerrainW && ty < sTerrainHt)
+                elev += sTerrainH[ty * 64 + tx];
+        }
         float c[4][3];
         if (tag.kind == PORT_VOXEL_OAM_DECAL) {
             const float y = elev + 0.25f, z0 = sy0 + scrollY, z1 = sy1 + scrollY;
@@ -3428,7 +3747,20 @@ static bool PresentImpl(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swap, int swa
 
         /* The camera, for the fade (the 3D pass below); the shader thins
          * room geometry (kind 0) only, never the backdrop, HUD or sprites. */
-        const float target3[3] = { sCam.absolute ? sCam.ox : scrollX + viewW * 0.5f + sCam.ox, sCam.oy,
+        /* the camera looks at the ground under the screen's centre (raised
+         * areas lift it), eased so steps don't jolt it */
+        static float sCamGround = 0.0f;
+        {
+            const int tx = (int)((scrollX + viewW * 0.5f) / 16.0f), ty = (int)((scrollY + 80.0f) / 16.0f);
+            float g = 0.0f;
+            if (tx >= 0 && ty >= 0 && tx < sTerrainW && ty < sTerrainHt)
+                g = sTerrainH[ty * 64 + tx];
+            sCamGround += (g - sCamGround) * 0.08f;
+            if (std::fabs(g - sCamGround) > 64.0f) /* new room: no slow climb */
+                sCamGround = g;
+        }
+        const float target3[3] = { sCam.absolute ? sCam.ox : scrollX + viewW * 0.5f + sCam.ox,
+                                   sCam.absolute ? sCam.oy : sCamGround + sCam.oy,
                                    sCam.absolute ? sCam.oz : scrollY + 80.0f + sCam.oz };
         const float eye[3] = { target3[0] + sCam.dist * sy * std::cos(pitch), sCam.dist * std::sin(pitch),
                                target3[2] + sCam.dist * cy * std::cos(pitch) };
