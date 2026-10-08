@@ -319,6 +319,7 @@ int sMapVertCount = 0;
 Uint64 sMapKey = 0;
 constexpr int kMaxProps = 256;
 Uint8 sMaskPixels[256 * 256];
+bool sPropOutlined[256]; /* per prop mask slot: from its closed outline (round), not its ground */
 int sPropCount = 0;
 uint32_t sBg0Pixels[MODE1_GBA_WIDTH * 480];
 
@@ -809,15 +810,22 @@ bool BuildPropMask(int x, int y, int slot, Uint32 charBase, bool bpp8) {
 }
 
 /* Prop whose outline is open (a sapling's leaves reach the tile edge): the
- * object is whatever differs from the ground tile (ux,uy) it was painted
- * over, pixel for pixel. Fails when that is most of the tile (not an object
- * on that ground) or too little to see. */
+ * object is every pixel whose colour the ground tile (ux,uy) never uses, so
+ * a differently arranged grass background still reads as ground. Fails when
+ * that is most of the tile (not an object on that ground) or too little to
+ * see. */
 bool BuildDiffMask(int x, int y, int ux, int uy, int slot, Uint32 charBase, bool bpp8) {
+    int ground[256], ng = 0;
+    for (int i = 0; i < 256; ++i) {
+        const int c = BottomPixel(ux, uy, i & 15, i >> 4, charBase, bpp8);
+        if (std::find(ground, ground + ng, c) == ground + ng)
+            ground[ng++] = c;
+    }
     bool obj[256];
     int count = 0;
     for (int i = 0; i < 256; ++i) {
-        const int px = i & 15, py = i >> 4;
-        obj[i] = BottomPixel(x, y, px, py, charBase, bpp8) != BottomPixel(ux, uy, px, py, charBase, bpp8);
+        const int c = BottomPixel(x, y, i & 15, i >> 4, charBase, bpp8);
+        obj[i] = std::find(ground, ground + ng, c) == ground + ng;
         count += obj[i];
     }
     if (count < 24 || count > 200)
@@ -1072,10 +1080,11 @@ void BuildMap(void) {
         Quad(sMapVerts, kMaxMapVerts, n, c, east ? u0 : u0 + 16, v0, east ? u0 + 16 : u0, v0 + 16, 0,
              top ? 128u : 0u, top ? tChar : bChar, (top ? t8 : b8) | 2u | (fill << 20) | (mask << 8));
     };
-    /* A prop (sapling, stump, sign, pot) as a pillar round the tile's centre:
-     * each run of art rows with the same opaque extent becomes a square slab
-     * that wide, every side wearing those rows. Solid from any angle, like a
-     * voxel model, at a handful of quads. slot: the prop's mask (1-based). */
+    /* A prop (sapling, sign, pot) as a voxel extrusion of its art round the
+     * tile's centre: each run of art rows with the same opaque extent becomes
+     * a slab that wide and at most 5 px deep, front and back wearing those
+     * rows and the sides their edge column. Solid from any angle at a handful
+     * of quads. slot: the prop's mask (1-based). */
     auto pillar = [&](int x, int y, Uint32 slot) {
         const int ox = (int)((slot - 1) % 16) * 16, oy = (int)((slot - 1) / 16) * 16;
         int extL[16], extR[16];
@@ -1087,24 +1096,30 @@ void BuildMap(void) {
         }
         const float cx = x * 16.0f + 8.0f, cz = y * 16.0f + 8.0f;
         const Uint32 params = baseParams(slot, 0);
+        /* An object its outline closes in (a bush, a pot) is round and keeps
+         * its full depth; one cut from its ground (a sapling) is thin. */
+        const bool round = sPropOutlined[slot - 1];
         for (int r0 = 0; r0 < 16;) {
             int r1 = r0 + 1;
             while (r1 < 16 && extL[r1] == extL[r0] && extR[r1] == extR[r0])
                 ++r1;
             if (extR[r0] >= 0) {
                 /* rows r0..r1-1, top of the tile = 16 px up */
-                const float hw = (extR[r0] - extL[r0] + 1) * 0.5f, hTop = 16.0f - r0, hBot = 16.0f - r1;
+                /* extruded, not square: the art's width across, a few px deep */
+                const float hw = (extR[r0] - extL[r0] + 1) * 0.5f, hd = round ? hw : std::min(hw, 2.5f);
+                const float hTop = 16.0f - r0, hBot = 16.0f - r1;
                 const float u0 = x * 16.0f + extL[r0], u1 = x * 16.0f + extR[r0] + 1;
                 const float v0 = y * 16.0f + r0, v1 = y * 16.0f + r1;
-                const float xa = cx - hw, xb = cx + hw, za = cz - hw, zb = cz + hw;
-                const float faces[4][4][3] = {
-                    { { xa, hTop, zb }, { xb, hTop, zb }, { xa, hBot, zb }, { xb, hBot, zb } }, /* south */
-                    { { xb, hTop, za }, { xa, hTop, za }, { xb, hBot, za }, { xa, hBot, za } }, /* north */
-                    { { xa, hTop, za }, { xa, hTop, zb }, { xa, hBot, za }, { xa, hBot, zb } }, /* west */
-                    { { xb, hTop, zb }, { xb, hTop, za }, { xb, hBot, zb }, { xb, hBot, za } }, /* east */
-                };
-                for (const auto& f : faces)
-                    Quad(sMapVerts, kMaxMapVerts, n, f, u0, v0, u1, v1, 0, 0u, bChar, params);
+                const float xa = cx - hw, xb = cx + hw, za = cz - hd, zb = cz + hd;
+                const float front[4][3] = { { xa, hTop, zb }, { xb, hTop, zb }, { xa, hBot, zb }, { xb, hBot, zb } };
+                const float back[4][3] = { { xb, hTop, za }, { xa, hTop, za }, { xb, hBot, za }, { xa, hBot, za } };
+                const float west[4][3] = { { xa, hTop, za }, { xa, hTop, zb }, { xa, hBot, za }, { xa, hBot, zb } };
+                const float east[4][3] = { { xb, hTop, zb }, { xb, hTop, za }, { xb, hBot, zb }, { xb, hBot, za } };
+                Quad(sMapVerts, kMaxMapVerts, n, front, u0, v0, u1, v1, 0, 0u, bChar, params);
+                Quad(sMapVerts, kMaxMapVerts, n, back, u1, v0, u0, v1, 0, 0u, bChar, params);
+                /* the sides wear the art's edge column, as an extrusion would */
+                Quad(sMapVerts, kMaxMapVerts, n, west, u0 + 0.25f, v0, u0 + 0.75f, v1, 0, 0u, bChar, params);
+                Quad(sMapVerts, kMaxMapVerts, n, east, u1 - 0.75f, v0, u1 - 0.25f, v1, 0, 0u, bChar, params);
                 /* the slab's top, where it sticks out past the one above */
                 if (r0 == 0 || extR[r0 - 1] < 0 || extL[r0 - 1] > extL[r0] || extR[r0 - 1] < extR[r0]) {
                     const float top[4][3] = { { xa, hTop, za }, { xb, hTop, za }, { xa, hTop, zb }, { xb, hTop, zb } };
@@ -1160,6 +1175,7 @@ void BuildMap(void) {
             if (joins(x, y, x, y - 1) || joins(x, y, x, y + 1) || joins(x, y, x - 1, y) || joins(x, y, x + 1, y)) {
                 if (Cover(x, y) || !outdoors || !Foliage(x, y) || !BuildPropMask(x, y, sPropCount, bChar, b8 != 0))
                     return false;
+                sPropOutlined[sPropCount] = true;
                 ++sPropCount;
                 return true;
             }
@@ -1168,10 +1184,27 @@ void BuildMap(void) {
         } else if (ov != PORT_VOXEL_SHAPE_PROP && Cover(x, y)) {
             return false;
         }
-        int ux, uy;
-        if (!BuildPropMask(x, y, sPropCount, bChar, b8 != 0) &&
-            !(groundFor(x, y, ux, uy) && BuildDiffMask(x, y, ux, uy, sPropCount, bChar, b8 != 0)))
-            return false;
+        sPropOutlined[sPropCount] = BuildPropMask(x, y, sPropCount, bChar, b8 != 0);
+        if (!sPropOutlined[sPropCount]) {
+            /* Open outline: the object is what differs from the ground it was
+             * painted over. Grass comes in variants, so try every walkable
+             * neighbour and the room's commonest ground; the first that leaves a
+             * plausible object wins. */
+            static const int kNb[4][2] = { { 0, 1 }, { -1, 0 }, { 1, 0 }, { 0, -1 } };
+            int cand[5][2], nc = 0;
+            for (const auto& d : kNb) {
+                const int nx = x + d[0], ny = y + d[1];
+                if (inRoom(nx, ny) && !Geom(nx, ny) && Cover(nx, ny) == 0 && SinkDepth(nx, ny) == 0.0f)
+                    cand[nc][0] = nx, cand[nc][1] = ny, ++nc;
+            }
+            if (groundX >= 0)
+                cand[nc][0] = groundX, cand[nc][1] = groundY, ++nc;
+            int c = 0;
+            while (c < nc && !BuildDiffMask(x, y, cand[c][0], cand[c][1], sPropCount, bChar, b8 != 0))
+                ++c;
+            if (c == nc)
+                return false;
+        }
         ++sPropCount;
         return true;
     };
@@ -1209,7 +1242,7 @@ void BuildMap(void) {
     for (int x = 0; x < W; ++x) {
         int y = H - 1;
         while (y >= 0) {
-            if (!Geom(x, y)) {
+            if (!Geom(x, y) || kind[y * 64 + x] == 1) { /* 1: a prop found on top of a run */
                 --y;
                 continue;
             }
@@ -1220,8 +1253,20 @@ void BuildMap(void) {
                 continue;
             }
             int yb = y;
-            while (y >= 0 && Geom(x, y))
+            --y;
+            /* Up the column while solid. A tile of another type standing on
+             * top of the run (a sapling planted against a tree's trunk) may be
+             * its own prop: the run ends below it (the scan skips it next).
+             * Only on top of trees: walls change type row to row too. */
+            while (y >= 0 && Geom(x, y)) {
+                if (BottomTileType(y * 64 + x) != BottomTileType((y + 1) * 64 + x) && outdoors &&
+                    (Cover(x, y + 1) || Foliage(x, y + 1)) && isProp(x, y)) {
+                    kind[y * 64 + x] = 1;
+                    propSlot[y * 64 + x] = (Uint32)sPropCount;
+                    break;
+                }
                 --y;
+            }
             const int yt = y + 1;
             /* Big trees' bottom rows are cast shadow and trunk: mostly dark
              * art under the canopy. They lie on the ground, the canopy box
