@@ -2946,30 +2946,48 @@ void BuildMap(void) {
             const int n0 = n;
             const bool stairV = (gMapBottom.actTiles[t] == 0x26 || gMapBottom.actTiles[t] == 0x34) && kind[t] == 0,
                        stairH = gMapBottom.actTiles[t] == 0x27 && kind[t] == 0;
-            if (stairV || stairH) {
-                /* stairs: four steps across the tile, climbing between the
-                 * ground at the run's ends (heights interpolated per tile) */
+            if (stairV) {
+                /* A run of stairs is one staircase, drawn from its top tile:
+                 * from the lower ground's edge to the upper ground's (both
+                 * shifted south by their heights, as the ground is), in even
+                 * 4-px risers, the run's art spread over the treads. */
+                if (inRoom(x, y - 1) && kind[t - 64] == 0 &&
+                    (gMapBottom.actTiles[t - 64] == 0x26 || gMapBottom.actTiles[t - 64] == 0x34))
+                    continue; /* drawn with the run's top tile */
+                int yb2 = y;
+                while (inRoom(x, yb2 + 1) && kind[(yb2 + 1) * 64 + x] == 0 &&
+                       (gMapBottom.actTiles[(yb2 + 1) * 64 + x] == 0x26 || gMapBottom.actTiles[(yb2 + 1) * 64 + x] == 0x34))
+                    ++yb2;
+                const float hUp = inRoom(x, y - 1) ? terr[t - 64] : terr[t];
+                const float hLow = inRoom(x, yb2 + 1) ? terr[(yb2 + 1) * 64 + x] : terr[yb2 * 64 + x];
+                const float zA = y * 16.0f + hUp, zB = (yb2 + 1) * 16.0f + hLow; /* north and south ends */
+                const float vA = y * 16.0f, vB = (yb2 + 1) * 16.0f;                  /* the run's art rows */
+                const int steps = std::max(1, (int)std::lround(std::fabs(hUp - hLow) / 4.0f));
+                const float x0 = x * 16.0f, x1 = x0 + 16;
+                for (int k = 0; k < steps; ++k) {
+                    const float f0 = (float)k / steps, f1 = (float)(k + 1) / steps; /* from the south */
+                    const float hk = hLow + (hUp - hLow) * f1, hPrev = hLow + (hUp - hLow) * f0;
+                    const float zs = zB + (zA - zB) * f0, zn = zB + (zA - zB) * f1;
+                    const float vs = vB + (vA - vB) * f0, vn = vB + (vA - vB) * f1;
+                    const float tread[4][3] = { { x0, hk, zn }, { x1, hk, zn }, { x0, hk, zs }, { x1, hk, zs } };
+                    Quad(sMapVerts, kMaxMapVerts, n, tread, x0, vn, x1, vs, 0, 0u, bChar, b8);
+                    const float riser[4][3] = { { x0, hk, zs }, { x1, hk, zs }, { x0, hPrev, zs }, { x1, hPrev, zs } };
+                    Quad(sMapVerts, kMaxMapVerts, n, riser, x0, vn, x1, vs, 0, 0u, bChar, b8);
+                }
+                continue;
+            }
+            if (stairH) {
+                /* stairs climbing east or west: four steps across each tile */
                 const float hc = terr[t];
-                const float hPrev = stairV ? (inRoom(x, y + 1) ? terr[t + 64] : hc) : (inRoom(x - 1, y) ? terr[t - 1] : hc);
-                const float hNext = stairV ? (inRoom(x, y - 1) ? terr[t - 64] : hc) : (inRoom(x + 1, y) ? terr[t + 1] : hc);
+                const float hPrev = inRoom(x - 1, y) ? terr[t - 1] : hc, hNext = inRoom(x + 1, y) ? terr[t + 1] : hc;
                 const float h0 = (hPrev + hc) * 0.5f, h1 = (hc + hNext) * 0.5f;
                 for (int k = 0; k < 4; ++k) {
                     const float hk = h0 + (h1 - h0) * (k + 1) / 4.0f, hkPrev = h0 + (h1 - h0) * k / 4.0f;
-                    if (stairV) { /* climbing north: step k from the south edge */
-                        const float z1 = y * 16.0f + 16 - k * 4.0f + hk, z0 = z1 - 4.0f;
-                        flatL(false, x, x, y, hk, z0, z1, 0);
-                        const float c[4][3] = { { x * 16.0f, hk, z1 }, { x * 16.0f + 16, hk, z1 },
-                                                { x * 16.0f, hkPrev, z1 }, { x * 16.0f + 16, hkPrev, z1 } };
-                        Quad(sMapVerts, kMaxMapVerts, n, c, x * 16.0f, z0, x * 16.0f + 16, z1, 0, 0u, bChar, b8);
-                    } else { /* climbing east: step k from the west edge */
-                        const float x0 = x * 16.0f + k * 4.0f, x1 = x0 + 4.0f;
-                        const float zs = y * 16.0f + hk;
-                        const float c[4][3] = { { x0, hk, zs }, { x1, hk, zs }, { x0, hk, zs + 16 }, { x1, hk, zs + 16 } };
-                        Quad(sMapVerts, kMaxMapVerts, n, c, x0, y * 16.0f, x1, y * 16.0f + 16, 0, 0u, bChar, b8);
-                        const float r[4][3] = { { x0, hk, zs + 16 }, { x0, hk, zs },
-                                                { x0, hkPrev, zs + 16 }, { x0, hkPrev, zs } };
-                        Quad(sMapVerts, kMaxMapVerts, n, r, x0, y * 16.0f, x0 + 1, y * 16.0f + 16, 0, 0u, bChar, b8);
-                    }
+                    const float x0 = x * 16.0f + k * 4.0f, x1 = x0 + 4.0f, zs = y * 16.0f + hk;
+                    const float c[4][3] = { { x0, hk, zs }, { x1, hk, zs }, { x0, hk, zs + 16 }, { x1, hk, zs + 16 } };
+                    Quad(sMapVerts, kMaxMapVerts, n, c, x0, y * 16.0f, x1, y * 16.0f + 16, 0, 0u, bChar, b8);
+                    const float r[4][3] = { { x0, hk, zs + 16 }, { x0, hk, zs }, { x0, hkPrev, zs + 16 }, { x0, hkPrev, zs } };
+                    Quad(sMapVerts, kMaxMapVerts, n, r, x0, y * 16.0f, x0 + 1, y * 16.0f + 16, 0, 0u, bChar, b8);
                 }
                 continue;
             }
@@ -3030,7 +3048,13 @@ void BuildMap(void) {
                 float c[4][3];
                 const float x0 = x * 16.0f, x1 = x0 + 16, z0 = y * 16.0f + hi, z1 = z0 + 16;
                 if (e == 0) { const float q[4][3] = { { x0, hi, z1 }, { x1, hi, z1 }, { x0, lo, z1 }, { x1, lo, z1 } }; std::memcpy(c, q, sizeof c); }
-                else if (e == 1) { const float q[4][3] = { { x1, hi, z0 }, { x0, hi, z0 }, { x1, lo, z0 }, { x0, lo, z0 } }; std::memcpy(c, q, sizeof c); }
+                else if (e == 1) {
+                    const float q[4][3] = { { x1, hi, z0 }, { x0, hi, z0 }, { x1, lo, z0 }, { x0, lo, z0 } };
+                    std::memcpy(c, q, sizeof c);
+                    /* the lower ground north of it, shifted south less, runs on
+                     * to this wall's foot */
+                    flatL(false, x, nx, ny, lo, y * 16.0f + lo, z0, 0);
+                }
                 else if (e == 2) { const float q[4][3] = { { x1, hi, z1 }, { x1, hi, z0 }, { x1, lo, z1 }, { x1, lo, z0 } }; std::memcpy(c, q, sizeof c); }
                 else { const float q[4][3] = { { x0, hi, z0 }, { x0, hi, z1 }, { x0, lo, z0 }, { x0, lo, z1 } }; std::memcpy(c, q, sizeof c); }
                 Quad(sMapVerts, kMaxMapVerts, n, c, x0, z0, x1, z1, 0, 0u, bChar, b8);
@@ -3136,29 +3160,23 @@ void BuildMap(void) {
                 ++ncomp;
                 if (cnt < 40)
                     continue;
-                /* shrubs drawn touching (two stacked) share an outline: a patch
-                 * two or more times longer than wide is that many round ones */
+                /* The art is the GBA's angled view: a round shrub as wide as the
+                 * patch, as deep as it is wide, standing on the patch's south
+                 * end; the rows above that are its height. */
                 const int pw = c1 - c0 + 1, ph = r1 - r0 + 1;
-                const int split = std::max(1, (int)std::lround((float)std::max(pw, ph) / std::min(pw, ph)));
-                for (int k = 0; k < split; ++k) {
-                const int sc0 = pw >= ph ? c0 + pw * k / split : c0, sc1 = pw >= ph ? c0 + pw * (k + 1) / split - 1 : c1;
-                const int sr0 = pw >= ph ? r0 : r0 + ph * k / split, sr1 = pw >= ph ? r1 : r0 + ph * (k + 1) / split - 1;
-                const float dcx = (sc0 + sc1 + 1) * 0.5f, dcz = (sr0 + sr1 + 1) * 0.5f;
-                const float drx = (sc1 - sc0 + 1) * 0.5f + 0.5f, drz = (sr1 - sr0 + 1) * 0.5f + 0.5f;
-                const float domeH = std::clamp(std::min(drx, drz) * 0.95f, 8.0f, 22.0f); /* a round shrub, not a box */
-                for (int vx = std::max(0, sc0 - 1); vx <= std::min(PW - 1, sc1 + 1); ++vx)
-                    for (int vz = std::max(0, sr0 - 1); vz <= std::min(PH - 1, sr1 + 1); ++vz) {
-                        const float ex = (vx + 0.5f - dcx) / drx, ez = (vz + 0.5f - dcz) / drz;
+                const float rx = pw * 0.5f, rz = std::min(pw, ph) * 0.5f;
+                const float Hh = std::clamp((float)(ph - std::min(pw, ph)), rz * 0.8f, (float)NH2 - 1.0f);
+                const float dcx = c0 + rx, dcz = r1 + 1 - rz;
+                for (int vx = std::max(0, c0); vx <= std::min(PW - 1, c1); ++vx)
+                    for (int vz = std::max(0, (int)(dcz - rz)); vz <= std::min(PH - 1, r1); ++vz) {
+                        const float ex = (vx + 0.5f - dcx) / rx, ez = (vz + 0.5f - dcz) / rz;
                         const float e = ex * ex + ez * ez;
                         if (e >= 1.0f)
                             continue;
-                        const int v = px(vx, vz);
-                        const float lum = v >= 0 ? ((v >> 5) & 31) / 31.0f : 0.5f;
-                        const float hTop = domeH * std::sqrt(1.0f - e) * (0.9f + 0.1f * lum);
+                        const float hTop = Hh * std::sqrt(1.0f - e);
                         for (int vh = 0; vh < std::min(NH2, (int)std::lround(hTop)); ++vh)
                             occ2[vx][vh][vz] = 1;
                     }
-                }
             }
         if (std::getenv("TMC_VOXEL_DUMPMAP")) {
             int bodyN = 0, outN = 0;
@@ -3189,23 +3207,21 @@ void BuildMap(void) {
             for (int vz = 0; vz < PH; ++vz) {
                 if (!occ2[vx][0][vz])
                     continue;
-                int tc, tr, sc, sr;
-                nearest(vx, vz, false, tc, tr);
-                nearest(vx, vz, true, sc, sr);
-                if (tc < 0)
-                    continue;
-                if (sc < 0)
-                    sc = tc, sr = tr;
-                const float ut = sh.x0 * 16.0f + tc + 0.5f, vt = sh.y0 * 16.0f + tr + 0.5f;
-                const float us = sh.x0 * 16.0f + sc + 0.5f, vs = sh.y0 * 16.0f + sr + 0.5f;
                 const float px0 = sh.x0 * 16.0f + vx, pz0 = sh.y0 * 16.0f + vz, px1 = px0 + 1, pz1 = pz0 + 1;
-                auto face = [&](const float (&q)[4][3], bool top) {
-                    Quad(sMapVerts, kMaxMapVerts, n, q, top ? ut : us, top ? vt : vs, top ? ut : us, top ? vt : vs, 0, 0u,
-                         bChar, params);
+                float ut = 0, vt = 0;
+                auto face = [&](const float (&q)[4][3], bool) {
+                    Quad(sMapVerts, kMaxMapVerts, n, q, ut, vt, ut, vt, 0, 0u, bChar, params);
                 };
                 for (int vh = 0; vh < NH2; ++vh) {
                     if (!occ2[vx][vh][vz])
                         continue;
+                    {
+                        int tc, tr;
+                        nearest(vx, std::max(0, vz - vh), false, tc, tr);
+                        if (tc < 0)
+                            tc = vx, tr = vz;
+                        ut = sh.x0 * 16.0f + tc + 0.5f, vt = sh.y0 * 16.0f + tr + 0.5f;
+                    }
                     const float bot = (float)vh, top = bot + 1;
                     if (!filled(vx, vh + 1, vz)) {
                         const float q[4][3] = { { px0, top, pz0 }, { px1, top, pz0 }, { px0, top, pz1 }, { px1, top, pz1 } };
@@ -3247,6 +3263,10 @@ void BuildMap(void) {
         const int x = rn.x, yt = rn.yt, yb = rn.yb, face = rn.face;
         const float topH = rn.topH, zFace = (yb + 1) * 16.0f;
         const float base = terr[yb * 64 + x];
+        /* ground behind as high as the top (a cliff under a plateau): the
+         * plateau's own ground reaches the wall's top, so this run draws no
+         * ground behind its footprint and no cap of its own over it */
+        const bool plateauBehind = yt > 0 && kind[(yt - 1) * 64 + x] != 2 && terr[(yt - 1) * 64 + x] >= base + topH - 1.0f;
         const int nRun = n;
         struct LiftOnExit {
             std::function<void()> f;
@@ -3272,6 +3292,8 @@ void BuildMap(void) {
         for (int r = yt; r <= yb; ++r) {
             if (!anyMask && !rn.floating && !hx && r >= rn.foot)
                 continue;
+            if (r < rn.foot && plateauBehind)
+                continue;
             if (r < rn.foot) {
                 /* Behind the footprint the 2D art has no ground (the object
                  * covered it): continue the ground north of the object. */
@@ -3279,8 +3301,12 @@ void BuildMap(void) {
                 while (uy >= 0 && Geom(x, uy))
                     --uy;
                 if (uy >= 0 && Cover(x, uy) < 2 && SinkDepth(x, uy) == 0.0f) {
+                    /* from where the ground behind ends (shifted by its own
+                     * height) to the box's back wall (shifted by the box's) */
                     const float dn = terr[uy * 64 + x] - base;
-                    flatL(false, x, x, uy, dn, r * 16.0f + dn, r * 16.0f + 16 + dn, 0);
+                    const int m = rn.foot - yt;
+                    const float zs = yt * 16.0f + dn, ze = rn.foot * 16.0f, step = (ze - zs) / m;
+                    flatL(false, x, x, uy, dn, zs + (r - yt) * step, zs + (r - yt + 1) * step, 0);
                     continue;
                 }
             }
@@ -3315,7 +3341,8 @@ void BuildMap(void) {
          * the art (north-edge extension) repeat the first row. */
         auto artRow = [&](int b) { return thin ? yt : std::max(yt, b - face); };
         if (thin) {
-            flatV(x, yt, topH, zFace - 8.0f, zFace, rowMask[yt], fillP);
+            if (!plateauBehind)
+                flatV(x, yt, topH, zFace - 8.0f, zFace, rowMask[yt], fillP);
         } else {
             for (int b = rn.foot; b <= yb; ++b)
                 flatV(x, artRow(b), topH, b * 16.0f, b * 16.0f + 16, rowMask[artRow(b)], fillP);
@@ -3344,6 +3371,24 @@ void BuildMap(void) {
             if ((hx || hAt(x + 1, b) < base + topH) && x < W - 1) {
                 leafFrom(-1, sx);
                 sideV(x, r, true, z0, z1, topH, (Uint32)fill, rowMask[r], -1.0f, sx, sx < 0 ? -1 : r);
+            }
+        }
+        /* Back: the GBA never shows a box's north side, but a free camera
+         * does: close it down to the ground behind, wearing the top's art. */
+        if (!plateauBehind && !rn.floating) {
+            const float zb = thin ? zFace - 8.0f : rn.foot * 16.0f;
+            const float behind = yt > 0 ? (kind[(yt - 1) * 64 + x] == 2 ? hmap[(yt - 1) * 64 + x] : terr[(yt - 1) * 64 + x])
+                                        : 0.0f;
+            /* down to the ground behind, even below this box's own base (a
+             * plateau's north edge over lower ground) */
+            const float lo = behind - base;
+            if (lo < topH - 0.5f) {
+                const int r = artRow(thin ? yb : rn.foot);
+                wallV(x, r, zb, lo, topH - lo, rowMask[r], fillP);
+                /* and that lower ground runs on to the wall's foot (it is
+                 * shifted south less than this box) */
+                if (lo < -0.5f && yt > 0 && kind[(yt - 1) * 64 + x] != 2)
+                    flatL(false, x, x, yt - 1, lo, yt * 16.0f + lo, zb, 0);
             }
         }
     }
