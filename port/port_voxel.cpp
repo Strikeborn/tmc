@@ -132,10 +132,17 @@ struct OrbitCam {
     int cfgPitch = -1;
     bool dragging = false;
     Uint64 lastNs = 0;
+    /* Free camera (G): the arrows pan its focus over the ground (Link stays
+     * put), PageUp/PageDown raise and lower it; it may turn to any angle and
+     * come right down to the ground. Off, it orbits the 2D screen's centre,
+     * so it follows whatever the game's camera does (cutscenes included). */
+    bool free = false;
+    float ox = 0.0f, oy = 0.0f, oz = 0.0f;
 };
 OrbitCam sCam;
-constexpr float kCamMinDist = 80.0f, kCamMaxDist = 900.0f;
-constexpr float kCamMinPitch = 10.0f, kCamMaxPitch = 85.0f;
+constexpr float kCamMinDist = 80.0f, kCamMaxDist = 900.0f, kFreeMinDist = 16.0f;
+constexpr float kCamMinPitch = 10.0f, kCamMaxPitch = 85.0f, kFreeMinPitch = 2.0f;
+constexpr float kFreePanRate = 160.0f; /* px/s at the default distance */
 constexpr float kCamTurnRate = 120.0f; /* deg/s, keys and stick */
 constexpr float kCamTiltRate = 60.0f;
 constexpr float kCamZoomRate = 2.0f; /* distance factor per second */
@@ -146,6 +153,8 @@ float SnappedYaw(void) {
 }
 
 void ResetCam(void) {
+    sCam.free = false;
+    sCam.ox = sCam.oy = sCam.oz = 0.0f;
     sCam.yaw = 0.0f;
     sCam.pitch = (float)Port_Config_GetVoxelPitch();
     sCam.dist = sCam.distGoal = kDistance;
@@ -164,7 +173,12 @@ void UpdateCam(void) {
         if (const char* p = std::getenv("TMC_VOXEL_PITCH"))
             sCam.pitch = (float)std::atof(p);
         if (const char* d = std::getenv("TMC_VOXEL_DIST")) /* times the default distance */
-            sCam.dist = sCam.distGoal = std::clamp(kDistance * (float)std::atof(d), kCamMinDist, kCamMaxDist);
+            sCam.dist = sCam.distGoal = std::clamp(kDistance * (float)std::atof(d), kFreeMinDist, kCamMaxDist);
+        /* free camera at an offset from the screen centre: "x,y,z" */
+        if (const char* f = std::getenv("TMC_VOXEL_FREE")) {
+            sCam.free = true;
+            std::sscanf(f, "%f,%f,%f", &sCam.ox, &sCam.oy, &sCam.oz);
+        }
     }
     float turn = 0.0f, tilt = 0.0f, zoom = 0.0f;
     if (!Port_DebugMenu_IsOpen() && !Port_ImGui_WantsTextInput()) {
@@ -187,11 +201,24 @@ void UpdateCam(void) {
         SDL_free(ids);
     }
     sCam.yaw += turn * kCamTurnRate * dt;
-    if (turn == 0.0f && !sCam.dragging) /* ease onto the nearest 45 deg */
+    if (turn == 0.0f && !sCam.dragging && !sCam.free) /* ease onto the nearest 45 deg */
         sCam.yaw += (SnappedYaw() - sCam.yaw) * std::min(1.0f, dt * 8.0f);
     sCam.yaw = std::fmod(sCam.yaw + 540.0f, 360.0f) - 180.0f;
-    sCam.pitch = std::clamp(sCam.pitch + tilt * kCamTiltRate * dt, kCamMinPitch, kCamMaxPitch);
-    sCam.distGoal = std::clamp(sCam.distGoal * std::pow(kCamZoomRate, zoom * dt), kCamMinDist, kCamMaxDist);
+    sCam.pitch = std::clamp(sCam.pitch + tilt * kCamTiltRate * dt, sCam.free ? kFreeMinPitch : kCamMinPitch,
+                            kCamMaxPitch);
+    sCam.distGoal = std::clamp(sCam.distGoal * std::pow(kCamZoomRate, zoom * dt),
+                               sCam.free ? kFreeMinDist : kCamMinDist, kCamMaxDist);
+    if (sCam.free && !Port_DebugMenu_IsOpen() && !Port_ImGui_WantsTextInput()) {
+        const bool* k = SDL_GetKeyboardState(nullptr);
+        const float fwd = (float)k[SDL_SCANCODE_UP] - (float)k[SDL_SCANCODE_DOWN];
+        const float side = (float)k[SDL_SCANCODE_RIGHT] - (float)k[SDL_SCANCODE_LEFT];
+        const float rise = (float)k[SDL_SCANCODE_PAGEUP] - (float)k[SDL_SCANCODE_PAGEDOWN];
+        const float a = sCam.yaw * 3.14159265f / 180.0f, rate = kFreePanRate * sCam.dist / kDistance * dt;
+        /* forward is away from the eye, which sits at +(sin yaw, cos yaw) */
+        sCam.ox += (-std::sin(a) * fwd + std::cos(a) * side) * rate;
+        sCam.oz += (-std::cos(a) * fwd - std::sin(a) * side) * rate;
+        sCam.oy = std::max(0.0f, sCam.oy + rise * rate);
+    }
     sCam.dist += (sCam.distGoal - sCam.dist) * std::min(1.0f, dt * 10.0f);
 }
 constexpr float kTopLayerLift = 16.0f; /* lifted overhead art floats one tile up */
@@ -1254,10 +1281,9 @@ void BuildMap(void) {
         const bool leafy = all > 0 && green * 2 > all;
         const bool round = sPropOutlined[slot - 1] || nr == 0 || runW[nr / 2] > 6 || leafy;
         /* A leafy round plant (a bush: lobes of leaves, dark creases between,
-         * soil showing under it) is a 1-px heightfield of its art: every leaf
-         * pixel a column rising from the ground, highest in the middle of a
-         * lobe (far from the edge, lit), lower in the creases and at the rim.
-         * Soil stays the ground's. */
+         * soil showing under it) is its art inflated into 1-px voxels: round
+         * lobes where the art has them, creases between. Soil stays the
+         * ground's. */
         if (round) {
             auto leafPx = [&](int c, int r) {
                 if (!on(c, r))
@@ -1296,53 +1322,101 @@ void BuildMap(void) {
                         }
                         dist[r][c] = d, maxD = std::max(maxD, d);
                     }
-                const float Hmax = std::clamp(maxD * 3.0f, 8.0f, 13.0f);
-                int hgt[16][16] = {};
-                for (int r = 0; r < 16; ++r)
-                    for (int c = 0; c < 16; ++c)
-                        if (dist[r][c]) {
-                            const int p = pix(c, r);
-                            const float lum = ((p >> 5) & 31) / 31.0f;
-                            float h = Hmax * std::sqrt(std::min(1.0f, dist[r][c] / (float)maxD)) * (0.8f + 0.2f * lum);
-                            if (Dark555(p))
-                                h *= 0.75f; /* outline: a crease */
-                            hgt[r][c] = std::max(1, (int)std::lround(h));
-                        }
-                auto hAtP = [&](int c, int r) { return c >= 0 && c < 16 && r >= 0 && r < 16 ? hgt[r][c] : 0; };
-                const Uint32 params = baseParams(0, 0);
+                /* Inflated: every leaf pixel (not a crease) is a ball as big
+                 * as it is deep inside its lobe, centred low so the lobe sits
+                 * on the ground; their union in 1-px voxels is the bush, each
+                 * voxel wearing the art pixel straight above it (or the
+                 * nearest leaf pixel, where a lobe bulges past the art). */
+                constexpr int NH = 20;
+                static Uint8 occ[16][NH][16]; /* [x][h][z] */
+                std::memset(occ, 0, sizeof(occ));
                 for (int r = 0; r < 16; ++r)
                     for (int c = 0; c < 16; ++c) {
-                        const int h = hgt[r][c];
-                        if (!h)
+                        if (!dist[r][c] || Dark555(pix(c, r)))
                             continue;
-                        const float px = x * 16.0f + c, pz = y * 16.0f + r, px1 = px + 1, pz1 = pz + 1, top = (float)h;
-                        const float u = px + 0.5f, v = pz + 0.5f;
+                        const float lum = ((pix(c, r) >> 5) & 31) / 31.0f;
+                        const float R = 0.8f + dist[r][c] * 1.1f, hc = R * 0.6f + lum * 1.5f;
+                        const float cx = c + 0.5f, cz = r + 0.5f;
+                        for (int vx = std::max(0, (int)(cx - R)); vx < std::min(16, (int)(cx + R) + 1); ++vx)
+                            for (int vz = std::max(0, (int)(cz - R)); vz < std::min(16, (int)(cz + R) + 1); ++vz)
+                                for (int vh = 0; vh < std::min(NH, (int)(hc + R) + 1); ++vh) {
+                                    const float dx = vx + 0.5f - cx, dz = vz + 0.5f - cz, dh = vh + 0.5f - hc;
+                                    if (dx * dx + dz * dz + dh * dh <= R * R)
+                                        occ[vx][vh][vz] = 1;
+                                }
+                    }
+                /* inside the art's outline only; creases between lobes stay
+                 * half as high as the clump */
+                int topH = 0;
+                for (int vx = 0; vx < 16; ++vx)
+                    for (int vz = 0; vz < 16; ++vz)
+                        for (int vh = NH - 1; vh >= 0; --vh)
+                            if (occ[vx][vh][vz]) {
+                                topH = std::max(topH, vh + 1);
+                                break;
+                            }
+                for (int vx = 0; vx < 16; ++vx)
+                    for (int vz = 0; vz < 16; ++vz) {
+                        const bool in = part(vx, vz), crease = in && Dark555(pix(vx, vz));
+                        for (int vh = 0; vh < NH; ++vh)
+                            if (!in || (crease && vh >= std::max(2, topH / 2)))
+                                occ[vx][vh][vz] = 0;
+                    }
+                /* colour source per column: the leaf pixel there, else the nearest */
+                int srcCol[16][16], srcRow[16][16];
+                for (int r = 0; r < 16; ++r)
+                    for (int c = 0; c < 16; ++c) {
+                        srcCol[r][c] = -1;
+                        for (int d = 0; d < 6 && srcCol[r][c] < 0; ++d)
+                            for (int dr = -d; dr <= d && srcCol[r][c] < 0; ++dr)
+                                for (int dc = -d; dc <= d; ++dc)
+                                    if (std::max(std::abs(dr), std::abs(dc)) == d && part(c + dc, r + dr) &&
+                                        !Dark555(pix(c + dc, r + dr))) {
+                                        srcCol[r][c] = c + dc, srcRow[r][c] = r + dr;
+                                        break;
+                                    }
+                    }
+                auto filled = [&](int vx, int vh, int vz) {
+                    return vx >= 0 && vx < 16 && vz >= 0 && vz < 16 && vh >= 0 && vh < NH && occ[vx][vh][vz];
+                };
+                const Uint32 params = baseParams(0, 0);
+                for (int vx = 0; vx < 16; ++vx)
+                    for (int vz = 0; vz < 16; ++vz) {
+                        if (srcCol[vz][vx] < 0)
+                            continue;
+                        const float u = x * 16.0f + srcCol[vz][vx] + 0.5f, v = y * 16.0f + srcRow[vz][vx] + 0.5f;
                         auto face = [&](const float (&q)[4][3]) {
                             Quad(sMapVerts, kMaxMapVerts, n, q, u, v, u, v, 0, 0u, bChar, params);
                         };
-                        {
-                            const float q[4][3] = { { px, top, pz }, { px1, top, pz }, { px, top, pz1 }, { px1, top, pz1 } };
-                            face(q);
-                        }
-                        float lo = (float)std::min(h, hAtP(c, r + 1));
-                        if (lo < top) {
-                            const float q[4][3] = { { px, top, pz1 }, { px1, top, pz1 }, { px, lo, pz1 }, { px1, lo, pz1 } };
-                            face(q);
-                        }
-                        lo = (float)std::min(h, hAtP(c, r - 1));
-                        if (lo < top) {
-                            const float q[4][3] = { { px1, top, pz }, { px, top, pz }, { px1, lo, pz }, { px, lo, pz } };
-                            face(q);
-                        }
-                        lo = (float)std::min(h, hAtP(c - 1, r));
-                        if (lo < top) {
-                            const float q[4][3] = { { px, top, pz }, { px, top, pz1 }, { px, lo, pz }, { px, lo, pz1 } };
-                            face(q);
-                        }
-                        lo = (float)std::min(h, hAtP(c + 1, r));
-                        if (lo < top) {
-                            const float q[4][3] = { { px1, top, pz1 }, { px1, top, pz }, { px1, lo, pz1 }, { px1, lo, pz } };
-                            face(q);
+                        const float px = x * 16.0f + vx, pz = y * 16.0f + vz, px1 = px + 1, pz1 = pz + 1;
+                        for (int vh = 0; vh < NH; ++vh) {
+                            if (!occ[vx][vh][vz])
+                                continue;
+                            const float bot = (float)vh, top = bot + 1;
+                            if (!filled(vx, vh + 1, vz)) {
+                                const float q[4][3] = { { px, top, pz }, { px1, top, pz }, { px, top, pz1 }, { px1, top, pz1 } };
+                                face(q);
+                            }
+                            if (vh > 0 && !filled(vx, vh - 1, vz)) {
+                                const float q[4][3] = { { px, bot, pz1 }, { px1, bot, pz1 }, { px, bot, pz }, { px1, bot, pz } };
+                                face(q);
+                            }
+                            if (!filled(vx, vh, vz + 1)) {
+                                const float q[4][3] = { { px, top, pz1 }, { px1, top, pz1 }, { px, bot, pz1 }, { px1, bot, pz1 } };
+                                face(q);
+                            }
+                            if (!filled(vx, vh, vz - 1)) {
+                                const float q[4][3] = { { px1, top, pz }, { px, top, pz }, { px1, bot, pz }, { px, bot, pz } };
+                                face(q);
+                            }
+                            if (!filled(vx - 1, vh, vz)) {
+                                const float q[4][3] = { { px, top, pz }, { px, top, pz1 }, { px, bot, pz }, { px, bot, pz1 } };
+                                face(q);
+                            }
+                            if (!filled(vx + 1, vh, vz)) {
+                                const float q[4][3] = { { px1, top, pz1 }, { px1, top, pz }, { px1, bot, pz1 }, { px1, bot, pz } };
+                                face(q);
+                            }
                         }
                     }
                 return;
@@ -1976,7 +2050,7 @@ void BuildMap(void) {
         const float xc = (lx0 + lx1 + 1) * 0.5f, rx = (lx1 - lx0 + 1) * 0.5f;
         const float mid = (ltop + lbot + 1) * 0.5f;
         const float rz = std::clamp(std::max((fz1 - fz0 + 1) * 0.5f, rx * 0.85f), 8.0f, 40.0f);
-        const float rh = std::clamp(rx * 0.8f, 10.0f, 40.0f);
+        const float rh = std::clamp(rx * 0.65f, 10.0f, 34.0f);
         const float zc = fz1 + 1.0f - rz, h0 = std::clamp(rx * 0.6f, 12.0f, 24.0f), hc = h0 + rh;
         /* the crown's rows in the GBA's view (z - h), which the leaves' rows
          * are stretched over for its colours */
@@ -2020,6 +2094,19 @@ void BuildMap(void) {
                         bark.push_back({ (short)(tx * 16 + (i & 15)), (short)(ty * 16 + (i >> 4)), ci >= 0 });
                 }
             }
+        {
+            /* the art's trunks are cool, greyish browns: keep the bluer half */
+            std::vector<BarkPx> cool;
+            for (const BarkPx& b : bark) {
+                const int ci = b.top ? TopIndex(b.x >> 4, b.y >> 4, b.x & 15, b.y & 15, tChar, t8 != 0)
+                                     : BottomIndex(b.x >> 4, b.y >> 4, b.x & 15, b.y & 15, bChar, b8 != 0);
+                const int c = ci >= 0 ? gBgPltt[ci] : 0;
+                if (((c >> 10) & 31) * 2 >= (c & 31))
+                    cool.push_back(b);
+            }
+            if (cool.size() >= 6)
+                bark.swap(cool);
+        }
         if (bark.size() < 6) {
             bark.clear();
             for (int ty = 0; ty < H && bark.size() < 2048; ++ty)
@@ -2027,7 +2114,7 @@ void BuildMap(void) {
                     if (!Cover(tx, ty))
                         for (int i = 0; i < 256; i += 5) {
                             const int c = BottomPixel(tx, ty, i & 15, i >> 4, bChar, b8 != 0);
-                            if (barkish(c) && std::max(c & 31, (c >> 5) & 31) < 18)
+                            if (barkish(c) && std::max(c & 31, (c >> 5) & 31) < 18 && ((c >> 10) & 31) * 3 >= (c & 31))
                                 bark.push_back({ (short)(tx * 16 + (i & 15)), (short)(ty * 16 + (i >> 4)), false });
                         }
         }
@@ -2112,7 +2199,13 @@ void BuildMap(void) {
         {
             trunkPass = true;
             const float half = std::max(fx1 - fx0 + 1, fz1 - fz0 + 1) * 0.5f;
-            const float k = std::clamp(std::max(6.0f, half * 0.45f) / half, 0.1f, 1.0f), hr = 8.0f;
+            const float k = std::clamp(std::max(6.0f, half * 0.45f) / half, 0.1f, 1.0f), hr = 9.0f;
+            /* roots: 5-7 lobes round the trunk, set per tree, that reach out
+             * to the footprint's edge low down; between them the base pulls
+             * in to the trunk sooner */
+            const unsigned seed = (unsigned)(tr.x0 * 7919 + tr.y0 * 104729);
+            const int nRoots = 5 + (int)(seed % 3u);
+            const float phase = (seed % 360u) * 3.14159265f / 180.0f;
             const int bx0 = fx0 & ~1, bz0 = fz0 & ~1;
             const int mx = std::min((fx1 - bx0) / V + 1, 40), mz = std::min((fz1 - bz0) / V + 1, 40),
                       mh = std::min((int)((h0 + 6.0f) / V), 40);
@@ -2121,7 +2214,10 @@ void BuildMap(void) {
                 for (int j = 0; j < mh; ++j)
                     for (int kk = 0; kk < mz; ++kk) {
                         const float px = bx0 + (i + 0.5f) * V, ph = (j + 0.5f) * V, pz = bz0 + (kk + 0.5f) * V;
-                        const float f = 1.0f - (1.0f - k) * std::min(1.0f, ph / hr);
+                        const float ang = std::atan2(pz - fcz, px - fcx) + phase;
+                        const float lobe = std::pow(std::fabs(std::cos(ang * nRoots * 0.5f)), 3.0f);
+                        const float rise = std::min(1.0f, ph / (hr * (0.35f + 0.65f * lobe)));
+                        const float f = 1.0f - (1.0f - k) * rise;
                         const int qx = (int)std::floor(fcx + (px - fcx) / f), qz = (int)std::floor(fcz + (pz - fcz) / f);
                         tocc[i][j][kk] = fn ? footAt(qx, qz)
                                             : (std::fabs(px - fcx) <= (fx1 - fx0 + 1) * 0.5f * f &&
@@ -2946,12 +3042,12 @@ static bool PresentImpl(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swap, int swa
 
         /* The camera, for the fade (the 3D pass below); the shader thins
          * room geometry (kind 0) only, never the backdrop, HUD or sprites. */
-        const float target3[3] = { scrollX + viewW * 0.5f, 0.0f, scrollY + 80.0f };
+        const float target3[3] = { scrollX + viewW * 0.5f + sCam.ox, sCam.oy, scrollY + 80.0f + sCam.oz };
         const float eye[3] = { target3[0] + sCam.dist * sy * std::cos(pitch), sCam.dist * std::sin(pitch),
                                target3[2] + sCam.dist * cy * std::cos(pitch) };
         static PortVoxelFade fade;
         fade.cam[0] = eye[0], fade.cam[1] = eye[1], fade.cam[2] = eye[2];
-        fade.cam[3] = Port_Config_GetVoxelWallFade() ? 1.0f : 0.0f;
+        fade.cam[3] = Port_Config_GetVoxelWallFade() && !sCam.free ? 1.0f : 0.0f; /* free: no Link to keep in view */
         fade.fade[0] = kFadeKeep, fade.fade[1] = kFadeRadius;
         fade.fade[2] = kFadeFeather, fade.fade[3] = kFadeAim;
         GatherFadeActors(fade);
@@ -2968,7 +3064,8 @@ static bool PresentImpl(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swap, int swa
         }
 
         /* 3D pass over the whole target. */
-        const Mat4 mvp = Mul(Perspective(kFovYDeg * 3.14159265f / 180.0f, (float)tw / (float)th, 32.0f, 4000.0f),
+        const Mat4 mvp = Mul(Perspective(kFovYDeg * 3.14159265f / 180.0f, (float)tw / (float)th,
+                                         sCam.free ? 4.0f : 32.0f, 4000.0f),
                              LookAt(eye, target3));
         SDL_PushGPUVertexUniformData(cmd, 0, mvp.m, sizeof(mvp.m));
         if (sMapVertCount > 0)
@@ -3052,9 +3149,15 @@ void Port_Voxel_HandleEvent(const SDL_Event* e) {
         }
         break;
     case SDL_EVENT_KEY_DOWN:
-        if (e->key.scancode == SDL_SCANCODE_H && !e->key.repeat && !Port_DebugMenu_IsOpen() &&
-            !Port_ImGui_WantsTextInput())
+        if (e->key.repeat || Port_DebugMenu_IsOpen() || Port_ImGui_WantsTextInput())
+            break;
+        if (e->key.scancode == SDL_SCANCODE_H)
             ResetCam();
+        else if (e->key.scancode == SDL_SCANCODE_G) {
+            sCam.free = !sCam.free;
+            if (!sCam.free) /* back to following the game: snap home */
+                ResetCam();
+        }
         break;
     default:
         break;
@@ -3068,6 +3171,10 @@ int Port_Voxel_ViewTurn(void) {
 }
 
 void Port_Voxel_RemapDpad(uint16_t* keyinput) {
+    if (sCam.free && sDrewLastFrame) { /* the arrows fly the free camera; Link stands */
+        *keyinput |= DPAD_RIGHT | DPAD_LEFT | DPAD_UP | DPAD_DOWN;
+        return;
+    }
     /* Only while walking round a room: menus and text-box choices keep the
      * plain D-pad. */
     if (gMessage.state & MESSAGE_ACTIVE)
