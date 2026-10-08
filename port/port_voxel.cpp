@@ -136,7 +136,7 @@ struct OrbitCam {
      * put), PageUp/PageDown raise and lower it; it may turn to any angle and
      * come right down to the ground. Off, it orbits the 2D screen's centre,
      * so it follows whatever the game's camera does (cutscenes included). */
-    bool free = false;
+    bool free = false, absolute = false; /* absolute: (ox, oy, oz) is a room point, not an offset */
     float ox = 0.0f, oy = 0.0f, oz = 0.0f;
 };
 OrbitCam sCam;
@@ -153,7 +153,7 @@ float SnappedYaw(void) {
 }
 
 void ResetCam(void) {
-    sCam.free = false;
+    sCam.free = sCam.absolute = false;
     sCam.ox = sCam.oy = sCam.oz = 0.0f;
     sCam.yaw = 0.0f;
     sCam.pitch = (float)Port_Config_GetVoxelPitch();
@@ -178,6 +178,11 @@ void UpdateCam(void) {
         if (const char* f = std::getenv("TMC_VOXEL_FREE")) {
             sCam.free = true;
             std::sscanf(f, "%f,%f,%f", &sCam.ox, &sCam.oy, &sCam.oz);
+        }
+        /* free camera aimed at a room pixel: "x,z,height" */
+        if (const char* f = std::getenv("TMC_VOXEL_FOCUS")) {
+            sCam.free = sCam.absolute = true;
+            std::sscanf(f, "%f,%f,%f", &sCam.ox, &sCam.oz, &sCam.oy);
         }
     }
     float turn = 0.0f, tilt = 0.0f, zoom = 0.0f;
@@ -1280,10 +1285,10 @@ void BuildMap(void) {
                     ++all, green += !brown(pix(c, r)) && !Dark555(pix(c, r));
         const bool leafy = all > 0 && green * 2 > all;
         const bool round = sPropOutlined[slot - 1] || nr == 0 || runW[nr / 2] > 6 || leafy;
-        /* A leafy round plant (a bush: lobes of leaves, dark creases between,
-         * soil showing under it) is its art inflated into 1-px voxels: round
-         * lobes where the art has them, creases between. Soil stays the
-         * ground's. */
+        /* A leafy round plant (a bush you can lift: a shrub of leaves, dark
+         * creases on it, soil showing under it) is one rounded dome of 1-px
+         * voxels over the shrub's extent, the art laid over it from above.
+         * Soil and the black ring round it stay the ground's. */
         if (round) {
             auto leafPx = [&](int c, int r) {
                 if (!on(c, r))
@@ -1291,20 +1296,39 @@ void BuildMap(void) {
                 const int p = pix(c, r);
                 return p >= 0 && !brown(p);
             };
-            /* the black outline round the outside (its shadow ring) is the
-             * ground's; outline inside the clump is a crease between lobes */
-            auto part = [&](int c, int r) {
-                if (!leafPx(c, r))
-                    return false;
-                if (!Dark555(pix(c, r)))
-                    return true;
-                for (int k = 0; k < 4; ++k) {
-                    static const int d[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
-                    if (!leafPx(c + d[k][0], r + d[k][1]))
-                        return false;
+            /* The shrub's body: its leaves with the creases between lobes
+             * closed up (the cut-out leaves those dark lines out, which would
+             * split it into islands): the leaf mask dilated then eroded by 1.
+             * The black ring round the outside stays the ground's. */
+            bool grown[16][16], body[16][16];
+            for (int r = 0; r < 16; ++r)
+                for (int c = 0; c < 16; ++c) {
+                    grown[r][c] = false;
+                    for (int dr = -1; dr <= 1 && !grown[r][c]; ++dr)
+                        for (int dc = -1; dc <= 1; ++dc)
+                            if (leafPx(c + dc, r + dr)) {
+                                grown[r][c] = true;
+                                break;
+                            }
                 }
-                return true;
-            };
+            for (int r = 0; r < 16; ++r)
+                for (int c = 0; c < 16; ++c) {
+                    body[r][c] = leafPx(c, r);
+                    if (body[r][c] || !grown[r][c])
+                        continue;
+                    bool all = true;
+                    for (int dr = -1; dr <= 1 && all; ++dr)
+                        for (int dc = -1; dc <= 1; ++dc) {
+                            const int rr2 = r + dr, cc2 = c + dc;
+                            if (rr2 < 0 || rr2 > 15 || cc2 < 0 || cc2 > 15 || !grown[rr2][cc2]) {
+                                all = false;
+                                break;
+                            }
+                        }
+                    const int p = pix(c, r);
+                    body[r][c] = all && p >= 0 && !brown(p);
+                }
+            auto part = [&](int c, int r) { return c >= 0 && c < 16 && r >= 0 && r < 16 && body[r][c]; };
             if (leafy) {
                 int dist[16][16] = {}, maxD = 0;
                 for (int r = 0; r < 16; ++r)
@@ -1330,51 +1354,53 @@ void BuildMap(void) {
                 constexpr int NH = 20;
                 static Uint8 occ[16][NH][16]; /* [x][h][z] */
                 std::memset(occ, 0, sizeof(occ));
+                /* one round shrub: a dome over the body's extent, a little
+                 * higher where the art is lit (the leaves' bumps) */
+                int c0 = 16, c1 = -1, r0 = 16, r1 = -1;
                 for (int r = 0; r < 16; ++r)
-                    for (int c = 0; c < 16; ++c) {
-                        if (!dist[r][c] || Dark555(pix(c, r)))
-                            continue;
-                        const float lum = ((pix(c, r) >> 5) & 31) / 31.0f;
-                        const float R = 0.8f + dist[r][c] * 1.1f, hc = R * 0.6f + lum * 1.5f;
-                        const float cx = c + 0.5f, cz = r + 0.5f;
-                        for (int vx = std::max(0, (int)(cx - R)); vx < std::min(16, (int)(cx + R) + 1); ++vx)
-                            for (int vz = std::max(0, (int)(cz - R)); vz < std::min(16, (int)(cz + R) + 1); ++vz)
-                                for (int vh = 0; vh < std::min(NH, (int)(hc + R) + 1); ++vh) {
-                                    const float dx = vx + 0.5f - cx, dz = vz + 0.5f - cz, dh = vh + 0.5f - hc;
-                                    if (dx * dx + dz * dz + dh * dh <= R * R)
-                                        occ[vx][vh][vz] = 1;
-                                }
-                    }
-                /* inside the art's outline only; creases between lobes stay
-                 * half as high as the clump */
-                int topH = 0;
-                for (int vx = 0; vx < 16; ++vx)
-                    for (int vz = 0; vz < 16; ++vz)
-                        for (int vh = NH - 1; vh >= 0; --vh)
-                            if (occ[vx][vh][vz]) {
-                                topH = std::max(topH, vh + 1);
-                                break;
-                            }
+                    for (int c = 0; c < 16; ++c)
+                        if (part(c, r))
+                            c0 = std::min(c0, c), c1 = std::max(c1, c), r0 = std::min(r0, r), r1 = std::max(r1, r);
+                if (c1 < 0)
+                    return;
+                const float dcx = (c0 + c1 + 1) * 0.5f, dcz = (r0 + r1 + 1) * 0.5f;
+                const float drx = (c1 - c0 + 1) * 0.5f + 0.5f, drz = (r1 - r0 + 1) * 0.5f + 0.5f;
+                const float domeH = std::clamp(std::min(drx, drz) * 1.35f, 7.0f, 12.0f);
                 for (int vx = 0; vx < 16; ++vx)
                     for (int vz = 0; vz < 16; ++vz) {
-                        const bool in = part(vx, vz), crease = in && Dark555(pix(vx, vz));
-                        for (int vh = 0; vh < NH; ++vh)
-                            if (!in || (crease && vh >= std::max(2, topH / 2)))
-                                occ[vx][vh][vz] = 0;
+                        const float ex = (vx + 0.5f - dcx) / drx, ez = (vz + 0.5f - dcz) / drz;
+                        const float e = std::pow(std::fabs(ex), 2.4f) + std::pow(std::fabs(ez), 2.4f);
+                        if (e >= 1.0f)
+                            continue;
+                        const int pc = std::clamp(vx, 0, 15), pr = std::clamp(vz, 0, 15);
+                        const int p = pix(pc, pr);
+                        const float lum = p >= 0 ? ((p >> 5) & 31) / 31.0f : 0.5f;
+                        const float hTop = domeH * std::pow(1.0f - e, 1.0f / 2.4f) * (0.88f + 0.12f * lum);
+                        for (int vh = 0; vh < std::min(NH, (int)std::lround(hTop)); ++vh)
+                            occ[vx][vh][vz] = 1;
                     }
+
                 /* colour source per column: the leaf pixel there, else the nearest */
-                int srcCol[16][16], srcRow[16][16];
+                /* (tops wear the art as drawn, creases and all; sides the
+                 * nearest leaf that isn't outline-black) */
+                int srcCol[16][16], srcRow[16][16], sideCol[16][16], sideRow[16][16];
+                auto nearest = [&](int c, int r, bool light, int& oc, int& orr) {
+                    oc = -1;
+                    for (int d = 0; d < 8 && oc < 0; ++d)
+                        for (int dr = -d; dr <= d && oc < 0; ++dr)
+                            for (int dc = -d; dc <= d; ++dc)
+                                if (std::max(std::abs(dr), std::abs(dc)) == d && part(c + dc, r + dr) &&
+                                    (!light || !Dark555(pix(c + dc, r + dr)))) {
+                                    oc = c + dc, orr = r + dr;
+                                    break;
+                                }
+                };
                 for (int r = 0; r < 16; ++r)
                     for (int c = 0; c < 16; ++c) {
-                        srcCol[r][c] = -1;
-                        for (int d = 0; d < 6 && srcCol[r][c] < 0; ++d)
-                            for (int dr = -d; dr <= d && srcCol[r][c] < 0; ++dr)
-                                for (int dc = -d; dc <= d; ++dc)
-                                    if (std::max(std::abs(dr), std::abs(dc)) == d && part(c + dc, r + dr) &&
-                                        !Dark555(pix(c + dc, r + dr))) {
-                                        srcCol[r][c] = c + dc, srcRow[r][c] = r + dr;
-                                        break;
-                                    }
+                        nearest(c, r, false, srcCol[r][c], srcRow[r][c]);
+                        nearest(c, r, true, sideCol[r][c], sideRow[r][c]);
+                        if (sideCol[r][c] < 0)
+                            sideCol[r][c] = srcCol[r][c], sideRow[r][c] = srcRow[r][c];
                     }
                 auto filled = [&](int vx, int vh, int vz) {
                     return vx >= 0 && vx < 16 && vz >= 0 && vz < 16 && vh >= 0 && vh < NH && occ[vx][vh][vz];
@@ -1385,8 +1411,11 @@ void BuildMap(void) {
                         if (srcCol[vz][vx] < 0)
                             continue;
                         const float u = x * 16.0f + srcCol[vz][vx] + 0.5f, v = y * 16.0f + srcRow[vz][vx] + 0.5f;
+                        const float us = x * 16.0f + sideCol[vz][vx] + 0.5f, vs = y * 16.0f + sideRow[vz][vx] + 0.5f;
+                        bool topFace = false;
                         auto face = [&](const float (&q)[4][3]) {
-                            Quad(sMapVerts, kMaxMapVerts, n, q, u, v, u, v, 0, 0u, bChar, params);
+                            Quad(sMapVerts, kMaxMapVerts, n, q, topFace ? u : us, topFace ? v : vs, topFace ? u : us,
+                                 topFace ? v : vs, 0, 0u, bChar, params);
                         };
                         const float px = x * 16.0f + vx, pz = y * 16.0f + vz, px1 = px + 1, pz1 = pz + 1;
                         for (int vh = 0; vh < NH; ++vh) {
@@ -1395,7 +1424,9 @@ void BuildMap(void) {
                             const float bot = (float)vh, top = bot + 1;
                             if (!filled(vx, vh + 1, vz)) {
                                 const float q[4][3] = { { px, top, pz }, { px1, top, pz }, { px, top, pz1 }, { px1, top, pz1 } };
+                                topFace = true;
                                 face(q);
+                                topFace = false;
                             }
                             if (vh > 0 && !filled(vx, vh - 1, vz)) {
                                 const float q[4][3] = { { px, bot, pz1 }, { px1, bot, pz1 }, { px, bot, pz }, { px1, bot, pz } };
@@ -1421,6 +1452,127 @@ void BuildMap(void) {
                     }
                 return;
             }
+        }
+        /* A sapling (trunk, roots, a few sprigs of leaves, cut from its
+         * ground) in half-pixel voxels: the trunk a round post following the
+         * art's bend; root pixels (the lowest rows' spread) reach out along the
+         * ground in five directions, sloping down as the art does; leaf and
+         * twig pixels stand on two crossed planes. Every voxel wears the art
+         * pixel it came from. */
+        if (!round) {
+            constexpr int S = 32; /* half-pixel cells per axis */
+            static Sint16 src[S][S][S]; /* [h][x][z]: art pixel r * 16 + c, -1 empty */
+            std::memset(src, -1, sizeof(src));
+            int rTop = 16, rBot = -1;
+            for (int r = 0; r < 16; ++r)
+                for (int c = 0; c < 16; ++c)
+                    if (on(c, r))
+                        rTop = std::min(rTop, r), rBot = std::max(rBot, r);
+            if (rBot < 0)
+                return;
+            const float trunkRad = std::clamp(runW[nr / 2] * 0.5f, 0.75f, 2.5f);
+            const int rootRows = std::max(2, (rBot - rTop + 1) / 3);
+            auto put = [&](float fx, float fh, float fz, int c, int r) { /* 1-px blob at (fx, fh, fz) in px */
+                for (int dx = 0; dx < 2; ++dx)
+                    for (int dz = 0; dz < 2; ++dz)
+                        for (int dh = 0; dh < 2; ++dh) {
+                            const int vx = (int)std::floor(fx * 2) + dx - 1 + 1, vz = (int)std::floor(fz * 2) + dz - 1 + 1,
+                                      vh = (int)std::floor(fh * 2) + dh;
+                            if (vx >= 0 && vx < S && vz >= 0 && vz < S && vh >= 0 && vh < S && src[vh][vx][vz] < 0)
+                                src[vh][vx][vz] = (Sint16)(r * 16 + c);
+                        }
+            };
+            static const float kRootAng[5] = { 0.3f, 1.55f, 2.8f, 4.0f, 5.2f };
+            for (int r = rTop; r <= rBot; ++r) {
+                const float h = (float)(rBot - r); /* px above the ground */
+                int l = -1, rr = -1;
+                for (int c0 : { 7, 8, 6, 9, 5, 10 })
+                    if (on(c0, r)) {
+                        l = rr = c0;
+                        break;
+                    }
+                if (l >= 0) {
+                    while (on(l - 1, r) && rr - l + 1 < 16)
+                        --l;
+                    while (on(rr + 1, r))
+                        ++rr;
+                }
+                const bool rootRow = r > rBot - rootRows;
+                /* trunk: a disc round this row's middle (roots excepted) */
+                float tc = 8.0f;
+                if (l >= 0) {
+                    tc = std::clamp((l + rr + 1) * 0.5f, 6.0f, 10.0f);
+                    const float rad = rootRow ? trunkRad + 0.5f : std::min(trunkRad, (rr - l + 1) * 0.5f);
+                    for (int vx = 0; vx < S; ++vx)
+                        for (int vz = 0; vz < S; ++vz) {
+                            const float fx = (vx + 0.5f) * 0.5f, fz = (vz + 0.5f) * 0.5f;
+                            const float d = std::hypot(fx - tc, fz - 8.0f);
+                            if (d > rad)
+                                continue;
+                            const int c = std::clamp((int)std::floor(fx), l, rr);
+                            for (int dh = 0; dh < 2; ++dh)
+                                if ((int)(h * 2) + dh < S)
+                                    src[(int)(h * 2) + dh][vx][vz] = (Sint16)(r * 16 + c);
+                        }
+                }
+                for (int c = 0; c < 16; ++c) {
+                    if (!on(c, r) || (l >= 0 && std::fabs(c + 0.5f - tc) <= trunkRad + 0.5f))
+                        continue;
+                    const float dx = c + 0.5f - tc;
+                    if (rootRow) { /* a root: out along the ground in five directions */
+                        const float out = std::fabs(dx);
+                        for (int a = 0; a < 5; ++a) {
+                            const float ang = kRootAng[a] + (dx < 0 ? 0.6f : 0.0f);
+                            put(tc + std::cos(ang) * out, h, 8.0f + std::sin(ang) * out, c, r);
+                        }
+                    } else { /* a sprig: two crossed planes through the trunk */
+                        put(tc + dx, h, 8.0f, c, r);
+                        put(tc, h, 8.0f + dx, c, r);
+                    }
+                }
+            }
+            auto at = [&](int vh, int vx, int vz) {
+                return vh >= 0 && vh < S && vx >= 0 && vx < S && vz >= 0 && vz < S && src[vh][vx][vz] >= 0;
+            };
+            const Uint32 params = baseParams(0, 0);
+            for (int vh = 0; vh < S; ++vh)
+                for (int vx = 0; vx < S; ++vx)
+                    for (int vz = 0; vz < S; ++vz) {
+                        const int sp = src[vh][vx][vz];
+                        if (sp < 0)
+                            continue;
+                        const float u = x * 16.0f + (sp & 15) + 0.5f, v = y * 16.0f + (sp >> 4) + 0.5f;
+                        auto face = [&](const float (&q)[4][3]) {
+                            Quad(sMapVerts, kMaxMapVerts, n, q, u, v, u, v, 0, 0u, bChar, params);
+                        };
+                        const float px = x * 16.0f + vx * 0.5f, pz = y * 16.0f + vz * 0.5f, px1 = px + 0.5f,
+                                    pz1 = pz + 0.5f, bot = vh * 0.5f, top = bot + 0.5f;
+                        if (!at(vh + 1, vx, vz)) {
+                            const float q[4][3] = { { px, top, pz }, { px1, top, pz }, { px, top, pz1 }, { px1, top, pz1 } };
+                            face(q);
+                        }
+                        if (vh > 0 && !at(vh - 1, vx, vz)) {
+                            const float q[4][3] = { { px, bot, pz1 }, { px1, bot, pz1 }, { px, bot, pz }, { px1, bot, pz } };
+                            face(q);
+                        }
+                        if (!at(vh, vx, vz + 1)) {
+                            const float q[4][3] = { { px, top, pz1 }, { px1, top, pz1 }, { px, bot, pz1 }, { px1, bot, pz1 } };
+                            face(q);
+                        }
+                        if (!at(vh, vx, vz - 1)) {
+                            const float q[4][3] = { { px1, top, pz }, { px, top, pz }, { px1, bot, pz }, { px, bot, pz } };
+                            face(q);
+                        }
+                        if (!at(vh, vx - 1, vz)) {
+                            const float q[4][3] = { { px, top, pz }, { px, top, pz1 }, { px, bot, pz }, { px, bot, pz1 } };
+                            face(q);
+                        }
+                        if (!at(vh, vx + 1, vz)) {
+                            const float q[4][3] = { { px1, top, pz1 }, { px1, top, pz }, { px1, bot, pz1 }, { px1, bot, pz } };
+                            face(q);
+                        }
+                    }
+            return;
         }
         int V = 1;
         if (round) {
@@ -2079,9 +2231,9 @@ void BuildMap(void) {
             bool top;
         };
         std::vector<BarkPx> bark;
-        auto barkish = [](int c) {
+        auto barkish = [](int c) { /* brown, neither near-black shadow nor bright soil */
             const int r = c & 31, g = (c >> 5) & 31;
-            return c >= 0 && r > g && std::max(r, g) < 24;
+            return c >= 0 && r > g && std::max(r, g) < 24 && std::max(r, g) >= 9;
         };
         for (int ty = tr.y0; ty <= tr.y1; ++ty)
             for (int tx = tr.x0; tx <= tr.x1; ++tx) {
@@ -2124,7 +2276,7 @@ void BuildMap(void) {
                 const unsigned hsh = (unsigned)((int)px * 73856093u ^ (int)ph * 19349663u ^ (int)pz * 83492791u);
                 const BarkPx& b = bark[hsh % bark.size()];
                 Quad(sMapVerts, kMaxMapVerts, n, q, b.x + 0.5f, b.y + 0.5f, b.x + 0.5f, b.y + 0.5f, 0,
-                     b.top ? 128u : 0u, b.top ? tChar : bChar, b.top ? t8 : b8);
+                     b.top ? 128u : 0u, b.top ? tChar : bChar, (b.top ? t8 : b8) | 0x40000000u /* bark */);
                 return;
             }
             int sx2 = (int)px;
@@ -3042,7 +3194,8 @@ static bool PresentImpl(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swap, int swa
 
         /* The camera, for the fade (the 3D pass below); the shader thins
          * room geometry (kind 0) only, never the backdrop, HUD or sprites. */
-        const float target3[3] = { scrollX + viewW * 0.5f + sCam.ox, sCam.oy, scrollY + 80.0f + sCam.oz };
+        const float target3[3] = { sCam.absolute ? sCam.ox : scrollX + viewW * 0.5f + sCam.ox, sCam.oy,
+                                   sCam.absolute ? sCam.oz : scrollY + 80.0f + sCam.oz };
         const float eye[3] = { target3[0] + sCam.dist * sy * std::cos(pitch), sCam.dist * std::sin(pitch),
                                target3[2] + sCam.dist * cy * std::cos(pitch) };
         static PortVoxelFade fade;

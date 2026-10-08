@@ -108,7 +108,7 @@ void main() {
             discard;
         uint entry = texelFetch(uMaps, ivec2(p.x >> 3, (p.y >> 3) + int(vParams.y)), 0).r;
         // w: bit0 8bpp, bit1 fill-transparent, bits 8-16 prop mask slot+1, bits 20-27 fill palette index,
-        //    bit31 lit (room geometry: shaded by the way it faces)
+        //    bit30 bark (cooled), bit31 lit (room geometry: shaded by the way it faces)
         uint mslot = (vParams.w >> 8) & 511u;
         if (mslot != 0u) {
             mslot -= 1u;
@@ -148,6 +148,11 @@ void main() {
     if (idx == 0u)
         discard;
     vec3 rgb = texelFetch(uPal, ivec2(int(idx), 0), 0).rgb;
+    // bit30 bark: the trunk's browns cooled toward a soft blue-grey, lifted
+    if (vParams.x == 0u && (vParams.w & 0x40000000u) != 0u) {
+        float g = dot(rgb, vec3(0.3, 0.59, 0.11));
+        rgb = mix(rgb, g * vec3(0.88, 0.94, 1.08), 0.6) * 1.15 + vec3(0.05, 0.06, 0.08);
+    }
     if (vParams.x == 0u && (vParams.w & 0x80000000u) != 0u)
         rgb *= faceShade();
     oColor = vec4(rgb, 1.0);
