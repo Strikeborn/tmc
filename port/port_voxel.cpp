@@ -2331,7 +2331,7 @@ void BuildMap(void) {
             if (!inRoom(x, y))
                 return false;
             const int t = y * 64 + x;
-            if (slopeV(x, y) || slopeH(x, y) || act(x, y) == 0x74)
+            if (slopeV(x, y) || slopeH(x, y) || act(x, y) == 0x74 || CliffTile(x, y))
                 return false;
             return !Geom(x, y) || kind[t] == 1 || kind[t] == 4;
         };
@@ -2363,19 +2363,36 @@ void BuildMap(void) {
             }
         /* votes: (upper, lower, height) */
         std::map<std::pair<int, int>, std::map<int, int>> votes;
-        auto vote = [&](int up, int low, int dh) {
+        auto vote = [&](int up, int low, int dh, int w = 1) {
             if (up < 0 || low < 0 || up == low || dh <= 0)
                 return;
             if (up < low)
-                ++votes[{ up, low }][dh];
+                votes[{ up, low }][dh] += w;
             else
-                ++votes[{ low, up }][-dh];
+                votes[{ low, up }][-dh] += w;
         };
         auto reg = [&](int x, int y) { return inRoom(x, y) ? region[y * 64 + x] : -1; };
         if (outdoors) {
-            for (const Run& rn : runs)
-                if (!rn.floating && !rn.ledge)
-                    vote(reg(rn.x, rn.yt - 1), reg(rn.x, rn.yb + 1), (int)std::lround(rn.topH));
+            for (const Run& rn : runs) {
+                if (rn.floating || rn.ledge)
+                    continue;
+                bool cliff = false;
+                for (int r = rn.yt; r <= rn.yb && !cliff; ++r)
+                    cliff = CliffTile(rn.x, r);
+                int up = rn.yt - 1; /* the top: past any cliff lip above the run */
+                while (up > 0 && reg(rn.x, up) < 0 && CliffTile(rn.x, up))
+                    --up;
+                if (cliff) /* a face's height is measured: it outweighs edges that only say which side is up */
+                    vote(reg(rn.x, up), reg(rn.x, rn.yb + 1), (int)std::lround(rn.topH), 3);
+            }
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x)
+                    if (act(x, y) == 0x2b) { /* a plateau's north edge: south of it is the top */
+                        int ys = y + 1;
+                        while (ys < H && reg(x, ys) < 0 && ys - y < 8)
+                            ++ys;
+                        vote(reg(x, ys), reg(x, y - 1), 16);
+                    }
             for (int y = 0; y < H; ++y)
                 for (int x = 0; x < W; ++x) {
                     if (act(x, y) != 0x74)
@@ -2398,101 +2415,87 @@ void BuildMap(void) {
                     }
                 }
         }
-        /* Heights as a smooth field over the ground tiles: each cliff column
-         * wants the ground north of it higher than the ground south of it by
-         * the cliff's height (strongly); each ledge a floor (strongly); any
-         * two neighbouring ground tiles want to be level (weakly). Ground a
-         * cliff encloses stays up; where the game joins levels without a
-         * tagged slope (a grassy gap, open stairs) the field ramps. Solved
-         * by relaxation; the lowest ground ends at 0. */
+        /* Each area is flat at one level. Every pair of areas takes the height
+         * difference most of its votes agree on; from the biggest area (at
+         * 0) levels spread along the best-supported pairs first. */
         auto inField = [&](int x, int y) {
-            if (!inRoom(x, y))
+            if (!inRoom(x, y) || CliffTile(x, y))
                 return false;
             const int t = y * 64 + x;
             return !Geom(x, y) || kind[t] == 1 || kind[t] == 4;
         };
-        struct Pull {
-            int to;
-            float d, w; /* wants h[self] - h[to] = d, with weight w */
-        };
-        static std::vector<Pull> pulls[64 * 64];
-        for (int t = 0; t < 64 * 64; ++t)
-            pulls[t].clear();
-        auto pull = [&](int ax, int ay, int bx, int by, float d, float w) { /* h[a] - h[b] = d */
-            if (!inField(ax, ay) || !inField(bx, by))
-                return;
-            pulls[ay * 64 + ax].push_back({ by * 64 + bx, d, w });
-            pulls[by * 64 + bx].push_back({ ay * 64 + ax, -d, w });
-        };
-        for (int y = 0; y < H; ++y)
-            for (int x = 0; x < W; ++x) {
-                pull(x, y, x + 1, y, 0.0f, 1.0f);
-                pull(x, y, x, y + 1, 0.0f, 1.0f);
-            }
-        int cliffCols = 0;
-        if (outdoors) {
-            /* only real cliffs (the game tags their tiles): a house or a wall
-             * has the same ground behind it as in front */
-            for (const Run& rn : runs) {
-                if (rn.floating || rn.ledge || !inField(rn.x, rn.yt - 1) || !inField(rn.x, rn.yb + 1))
-                    continue;
-                bool cliff = false;
-                for (int r = rn.yt; r <= rn.yb && !cliff; ++r)
-                    cliff = CliffTile(rn.x, r);
-                if (!cliff)
-                    continue;
-                pull(rn.x, rn.yt - 1, rn.x, rn.yb + 1, rn.topH, 40.0f);
-                ++cliffCols;
-            }
-            for (int y = 0; y < H; ++y)
-                for (int x = 0; x < W; ++x) {
-                    if (act(x, y) != 0x74)
-                        continue;
-                    switch (gMapBottom.collisionData[y * 64 + x]) { /* upper side away from the solid half */
-                        case 0x0C: pull(x, y + 1, x, y - 1, 16.0f, 40.0f); break;
-                        case 0x03: pull(x, y - 1, x, y + 1, 16.0f, 40.0f); break;
-                        case 0x0A: pull(x + 1, y, x - 1, y, 16.0f, 40.0f); break;
-                        case 0x05: pull(x - 1, y, x + 1, y, 16.0f, 40.0f); break;
-                        default: break;
-                    }
-                }
-        }
-        static float hf[64 * 64];
-        for (int t = 0; t < 64 * 64; ++t)
-            hf[t] = 0.0f;
-        if (cliffCols > 0)
-            for (int it = 0; it < 1500; ++it)
-                for (int y = 0; y < H; ++y)
-                    for (int x = 0; x < W; ++x) {
-                        const int t = y * 64 + x;
-                        if (pulls[t].empty())
-                            continue;
-                        float sw = 0.0f, sv = 0.0f;
-                        for (const Pull& q : pulls[t])
-                            sw += q.w, sv += q.w * (hf[q.to] + q.d);
-                        hf[t] += 1.85f * (sv / sw - hf[t]); /* over-relaxed */
-                    }
-        float lowest = 1e9f;
-        for (int y = 0; y < H; ++y)
-            for (int x = 0; x < W; ++x)
-                if (inField(x, y))
-                    lowest = std::min(lowest, hf[y * 64 + x]);
-        if (lowest > 1e8f)
-            lowest = 0.0f;
-        /* Ground stands on whole floors (16 px): areas lie flat and where
-         * the field crosses between floors the step is a wall. Stairs keep
-         * their in-between heights and climb. */
-        for (int y = 0; y < H; ++y)
-            for (int x = 0; x < W; ++x)
-                if (inField(x, y)) {
-                    const float v = hf[y * 64 + x] - lowest;
-                    terr[y * 64 + x] = slopeV(x, y) || slopeH(x, y) ? std::round(v * 0.5f) * 2.0f
-                                                                    : std::round(v / 16.0f) * 16.0f;
-                }
         struct Link2 {
             int a, b, dh, n;
         };
         std::vector<Link2> links;
+        for (const auto& pv : votes) {
+            int bestDh = 0, bestN = 0;
+            for (const auto& dv : pv.second)
+                if (dv.second > bestN)
+                    bestN = dv.second, bestDh = dv.first;
+            links.push_back({ pv.first.first, pv.first.second, bestDh, bestN });
+        }
+        std::sort(links.begin(), links.end(), [](const Link2& l, const Link2& r) { return l.n > r.n; });
+        std::vector<float> rh(nreg, 0.0f);
+        std::vector<char> known(nreg, 0);
+        for (;;) {
+            int root = -1;
+            for (int r = 0; r < nreg; ++r)
+                if (!known[r] && (root < 0 || regionSize[r] > regionSize[root]))
+                    root = r;
+            if (root < 0)
+                break;
+            known[root] = 1, rh[root] = 0.0f;
+            for (bool grew = true; grew;) {
+                grew = false;
+                for (const Link2& l : links) {
+                    if (known[l.a] && !known[l.b])
+                        rh[l.b] = rh[l.a] - l.dh, known[l.b] = 1, grew = true;
+                    else if (known[l.b] && !known[l.a])
+                        rh[l.a] = rh[l.b] + l.dh, known[l.a] = 1, grew = true;
+                    if (grew)
+                        break;
+                }
+            }
+        }
+        float lowest = 0.0f;
+        for (int r = 0; r < nreg; ++r)
+            lowest = std::min(lowest, rh[r]);
+        for (int t = 0; t < 64 * 64; ++t)
+            if (region[t] >= 0)
+                terr[t] = rh[region[t]] - lowest;
+        /* stairs, grades, ledge lips: relaxed between the fixed levels round them */
+        static float hf[64 * 64];
+        auto loose = [&](int x, int y) { return inField(x, y) && region[y * 64 + x] < 0; };
+        for (int it = 0; it < 400; ++it)
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    if (!loose(x, y))
+                        continue;
+                    float sw = 0.0f, sv = 0.0f;
+                    static const int d[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+                    for (const auto& k : d)
+                        if (inField(x + k[0], y + k[1]))
+                            sw += 1.0f, sv += terr[(y + k[1]) * 64 + x + k[0]];
+                    if (sw > 0.0f)
+                        terr[y * 64 + x] = sv / sw;
+                }
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x)
+                if (loose(x, y))
+                    terr[y * 64 + x] = std::round(terr[y * 64 + x] * 0.5f) * 2.0f;
+        (void)hf;
+        /* cliff-tagged floor tiles: their higher neighbour's height */
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x)
+                if (CliffTile(x, y) && kind[y * 64 + x] != 2) {
+                    float h = 0.0f;
+                    static const int d[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+                    for (const auto& k : d)
+                        if (inField(x + k[0], y + k[1]))
+                            h = std::max(h, terr[(y + k[1]) * 64 + x + k[0]]);
+                    terr[y * 64 + x] = h;
+                }
         /* boxes stand on the area in front of them (south), else behind */
         for (const Run& rn : runs) {
             float base = 0.0f;
@@ -2517,7 +2520,8 @@ void BuildMap(void) {
                 char line[80];
                 for (int x = 0; x < W; ++x) {
                     const int r = region[y * 64 + x];
-                    line[x] = r < 0 ? (CliffTile(x, y) ? '#' : '.') : (char)(r < 10 ? '0' + r : 'a' + (r - 10) % 26);
+                    (void)r; /* the solved height, in floors (16 px); '#' a box */
+                    line[x] = kind[y * 64 + x] == 2 ? '#' : (char)('0' + std::clamp((int)std::lround(terr[y * 64 + x] / 16.0f), 0, 9));
                 }
                 line[W] = 0;
                 std::fprintf(stderr, "[voxel-area] %2d %s\n", y, line);
