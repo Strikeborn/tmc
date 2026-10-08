@@ -65,6 +65,9 @@ union SDL_Event;
 void Port_Voxel_HandleEvent(const union SDL_Event* e);
 /* Turns the D-pad with the camera so "up" walks away from it. */
 void Port_Voxel_RemapDpad(uint16_t* keyinput);
+/* Once per frame: in the 3D view a swimming Link passes under bridges (their
+ * tiles act as the river under them while he swims). */
+void Port_Voxel_BridgeTick(void);
 /* Camera turn in 45 deg steps (0..7) while walking round a room in the 3D
  * view, else 0: added to an animationState to pick the sprite facing the
  * camera. */

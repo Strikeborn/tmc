@@ -146,6 +146,7 @@ static void Port_UpdateInput(void) {
         }
     }
     Port_Voxel_RemapDpad(&keyinput); /* D-pad turns with the 3D camera */
+    Port_Voxel_BridgeTick();
 
     /* Soft-slots (X / Y / L2 / R2): when one is held with an item
      * assigned, force GBA B_BUTTON pressed so the engine spawns the

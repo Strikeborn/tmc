@@ -1040,12 +1040,23 @@ void Port_QuickSave_AutoTick(void) {
                         gPlayerEntity.base.y.HALF.HI);
             }
             const char* walk = getenv("TMC_REPRO_LOAD_WALK");
-            if (walk && after > at + 10 && after < at + 70)
+            /* TMC_REPRO_LOAD_WALK_FRAMES: how long to walk (default 60); a
+             * second pair of shots (3d_after/2d_after) where it ends */
+            const char* wf = getenv("TMC_REPRO_LOAD_WALK_FRAMES");
+            const int walkFrames = wf && *wf ? atoi(wf) : 60;
+            if (walk && after > at + 10 && after < at + 10 + walkFrames)
                 Port_Config_TestForceEdge(*walk == 'u'   ? PORT_INPUT_UP
                                           : *walk == 'd' ? PORT_INPUT_DOWN
                                           : *walk == 'l' ? PORT_INPUT_LEFT
                                                          : PORT_INPUT_RIGHT);
-            if (after == (walk ? at + 80 : at + 5)) {
+            if (walk && after == at + 12 + walkFrames) {
+                char path[512];
+                snprintf(path, sizeof(path), "%s/3d_after.png", shot);
+                Port_Voxel_RequestShot(path);
+                snprintf(path, sizeof(path), "%s/2d_after.png", shot);
+                Port_CaptureBaseFramebufferPNG(path);
+            }
+            if (after == (walk ? at + 20 + walkFrames : at + 5)) {
                 fprintf(stderr, "[quicksave] repro: after walk link=%d,%d\n", gPlayerEntity.base.x.HALF.HI,
                         gPlayerEntity.base.y.HALF.HI);
                 fflush(stderr);

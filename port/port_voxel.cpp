@@ -359,6 +359,29 @@ float sTerrainH[64 * 64];
 /* Over a voxel roof: how far up (and south) what the 2D game draws on the
  * roof's art stands (chimney smoke). */
 float sRoofH[64 * 64];
+/* Bridges over water (BuildMap finds them): a swimmer passes under, so while
+ * Link swims their tiles take the river's collision; the originals come back
+ * when he stops. sBridgeWater: the river's height under each bridge tile. */
+struct BridgeTile {
+    int t;
+    u8 coll, act, waterColl, waterAct;
+};
+std::vector<BridgeTile> sBridge;
+bool sBridgeSwapped = false;
+int sBridgeRoom = -1;
+float sBridgeWater[64 * 64];
+int CurrentRoomId(void) {
+    return (int)gRoomControls.area << 8 | gRoomControls.room;
+}
+void BridgeSwap(bool on) {
+    if (on == sBridgeSwapped)
+        return;
+    for (const BridgeTile& b : sBridge) {
+        gMapBottom.collisionData[b.t] = on ? b.waterColl : b.coll;
+        gMapBottom.actTiles[b.t] = on ? b.waterAct : b.act;
+    }
+    sBridgeSwapped = on;
+}
 int sTerrainW = 0, sTerrainHt = 0;
 Uint64 sMapKey = 0;
 constexpr int kMaskRows = 512; /* mask atlas: 256 x 512, 16 x 32 slots of 16 x 16 */
@@ -996,7 +1019,15 @@ Uint64 MapKey(void) {
         for (size_t i = 0; i < len; ++i)
             h = (h ^ b[i]) * 1099511628211ull;
     };
-    mix(gMapBottom.collisionData, sizeof(gMapBottom.collisionData));
+    if (sBridgeSwapped && sBridgeRoom == CurrentRoomId()) { /* hash the bridge as it really is */
+        static u8 coll[sizeof(gMapBottom.collisionData)];
+        std::memcpy(coll, gMapBottom.collisionData, sizeof(coll));
+        for (const BridgeTile& b : sBridge)
+            coll[b.t] = b.coll;
+        mix(coll, sizeof(coll));
+    } else {
+        mix(gMapBottom.collisionData, sizeof(gMapBottom.collisionData));
+    }
     mix(gMapDataTopSpecial, sizeof(u16) * 0x4000);
     mix(gMapDataBottomSpecial, sizeof(u16) * 0x4000);
     mix(&gRoomControls.width, sizeof(gRoomControls.width));
@@ -2680,6 +2711,36 @@ void BuildMap(void) {
                 hmap[t] = terr[t];
         std::memcpy(sTerrainH, terr, sizeof(sTerrainH));
         sTerrainW = W, sTerrainHt = H;
+        /* bridges: raised floor (and its ledge lips) with lower water within
+         * three tiles north and south in its column */
+        sBridge.clear();
+        for (int t = 0; t < 64 * 64; ++t)
+            sBridgeWater[t] = -1e9f;
+        if (outdoors)
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const int t = y * 64 + x;
+                    if (kind[t] != 0 || SinkDepth(x, y) < 0.0f || CliffTile(x, y))
+                        continue;
+                    int wn = -1, ws = -1;
+                    for (int d = 1; d <= 3; ++d) {
+                        auto water = [&](int yy) {
+                            return inRoom(x, yy) && kind[yy * 64 + x] == 0 && SinkDepth(x, yy) < 0.0f &&
+                                   terr[yy * 64 + x] < terr[t] - 4.0f;
+                        };
+                        if (wn < 0 && water(y - d))
+                            wn = y - d;
+                        if (ws < 0 && water(y + d))
+                            ws = y + d;
+                    }
+                    if (wn < 0 || ws < 0)
+                        continue;
+                    const int wt = wn * 64 + x;
+                    sBridge.push_back({ t, gMapBottom.collisionData[t], gMapBottom.actTiles[t],
+                                        gMapBottom.collisionData[wt], gMapBottom.actTiles[wt] });
+                    sBridgeWater[t] = terr[wt] + SinkDepth(x, wn);
+                }
+        sBridgeRoom = CurrentRoomId();
         if (std::getenv("TMC_VOXEL_DUMPMAP")) {
             std::fprintf(stderr, "[voxel-terrain] %d areas, %zu links\n", nreg, links.size());
             /* both collision layers: bottom coll/act | top coll/act */
@@ -4082,8 +4143,12 @@ static void GatherFadeActors(PortVoxelFade& f) {
         f.actors[n][2] = (float)(e.y.HALF.HI - gRoomControls.origin_y);
         { /* standing on raised ground */
             const int tx = (int)f.actors[n][0] >> 4, ty = (int)f.actors[n][2] >> 4;
-            if (tx >= 0 && ty >= 0 && tx < sTerrainW && ty < sTerrainHt)
-                f.actors[n][1] += sTerrainH[ty * 64 + tx], f.actors[n][2] += sTerrainH[ty * 64 + tx];
+            if (tx >= 0 && ty >= 0 && tx < sTerrainW && ty < sTerrainHt) {
+                float g = sTerrainH[ty * 64 + tx];
+                if (&e == &gPlayerEntity.base && sBridgeSwapped && sBridgeWater[ty * 64 + tx] > -1e8f)
+                    g = sBridgeWater[ty * 64 + tx];
+                f.actors[n][1] += g, f.actors[n][2] += g;
+            }
         }
         f.actors[n][3] = 0.0f;
         ++n;
@@ -4198,7 +4263,13 @@ static bool PresentImpl(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swap, int swa
         if (VoxelDebug())
             fprintf(stderr, "[voxel-dbg] f=%u rebuild (%s)\n", sPresentFrame,
                     mapKey != sMapKey ? "map changed" : "settle");
+        const bool swapped = sBridgeSwapped && sBridgeRoom == CurrentRoomId();
+        if (sBridgeRoom != CurrentRoomId())
+            sBridgeSwapped = false, sBridge.clear(); /* a new room's map: nothing to restore */
+        BridgeSwap(false);
         BuildMap();
+        if (swapped)
+            BridgeSwap(true);
         sMapKey = mapKey;
     }
 
@@ -4254,6 +4325,8 @@ static bool PresentImpl(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swap, int swa
                 groundShift = sTerrainH[ty * 64 + tx];
                 if (!tag.player) /* drawn on a roof's art: on the roof */
                     groundShift += sRoofH[ty * 64 + tx];
+                else if (sBridgeSwapped && sBridgeWater[ty * 64 + tx] > -1e8f) /* swimming under a bridge */
+                    groundShift = sBridgeWater[ty * 64 + tx];
             }
             elev += groundShift;
         }
@@ -4662,6 +4735,25 @@ int Port_Voxel_ViewTurn(void) {
     if (!sDrewLastFrame || !SceneApplicable())
         return 0;
     return ((int)std::lround(SnappedYaw() / 45.0f) % 8 + 8) % 8;
+}
+
+void Port_Voxel_BridgeTick(void) {
+    if (sBridgeRoom != CurrentRoomId()) { /* left the room: its map is gone, nothing to restore */
+        sBridgeSwapped = false;
+        sBridge.clear();
+        return;
+    }
+    if (sBridge.empty())
+        return;
+    /* swimming in the 3D view, or still under a bridge whatever the view */
+    bool under = false;
+    if (sBridgeSwapped) {
+        const int tx = (gPlayerEntity.base.x.HALF.HI - gRoomControls.origin_x) >> 4,
+                  ty = (gPlayerEntity.base.y.HALF.HI - gRoomControls.origin_y) >> 4;
+        under = tx >= 0 && ty >= 0 && tx < 64 && ty < 64 && sBridgeWater[ty * 64 + tx] > -1e8f;
+    }
+    const bool swimming = gPlayerState.swim_state != 0;
+    BridgeSwap(swimming && ((sDrewLastFrame && SceneApplicable()) || under));
 }
 
 void Port_Voxel_RemapDpad(uint16_t* keyinput) {
