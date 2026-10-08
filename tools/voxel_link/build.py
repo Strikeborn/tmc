@@ -361,6 +361,123 @@ def carve_pose(img, direction: int, scale: int, prof: Profile, base: dict):
     return vox
 
 
+# ---- rig: one permanent model, parts moved per frame ----------------------
+HEAD, BODY, FOOT_L, FOOT_R, ARM_L, ARM_R = 1, 2, 3, 4, 5, 6
+CLOTH, SKIN, BOOTS, EYE = PARTS.index("cloth"), PARTS.index("skin"), PARTS.index("boots"), PARTS.index("eye")
+
+
+def neck_row(img) -> int:
+    """First row below the eyes where the tunic takes over (the chin)."""
+    part = parts_of(img)
+    a = img[..., 3] > 0
+    eye_rows = np.nonzero((part == EYE).any(axis=1))[0]
+    start = (eye_rows.max() + 1) if len(eye_rows) else np.nonzero(a.any(axis=1))[0].min() + 8
+    for y in range(start, SIZE):
+        row = a[y]
+        if row.any() and (part[y][row] == CLOTH).mean() >= 0.5:
+            return y
+    return start
+
+
+def rig_labels(front) -> np.ndarray:
+    """Body part per sprite pixel of the standing front picture."""
+    part = parts_of(front)
+    a = front[..., 3] > 0
+    neck = neck_row(front)
+    lab = np.zeros((SIZE, SIZE), int)
+    for y, x in zip(*np.nonzero(a)):
+        if y < neck:
+            lab[y, x] = HEAD
+        elif part[y, x] == BOOTS or y >= FOOT_Y - 2:
+            lab[y, x] = FOOT_L if x < FOOT_X else FOOT_R
+        elif part[y, x] == SKIN and abs(x - FOOT_X + 0.5) >= 5:
+            lab[y, x] = ARM_L if x < FOOT_X else ARM_R
+        else:
+            lab[y, x] = BODY
+    return lab
+
+
+def centroid(mask) -> tuple[float, float] | None:
+    ys, xs = np.nonzero(mask)
+    return (float(xs.mean()), float(ys.mean())) if len(ys) else None
+
+
+def measure(img, side_view: bool) -> dict:
+    """Where the parts are in one frame (sprite px): head top/centre, neck,
+    each foot and hand. A side picture's x is forward (z)."""
+    part = parts_of(img)
+    a = img[..., 3] > 0
+    rows = np.nonzero(a.any(axis=1))[0]
+    neck = neck_row(img)
+    head = a.copy()
+    head[neck:] = False
+    m = {"top": float(rows.min()), "neck": float(neck), "head": centroid(head)}
+    below = np.zeros_like(a)
+    below[neck:] = True
+    boots = a & below & ((part == BOOTS) | (np.arange(SIZE)[:, None] >= FOOT_Y - 2))
+    skin = a & below & (part == SKIN)
+    if not side_view:
+        cx = FOOT_X - 0.5
+        left = np.arange(SIZE)[None, :] < cx
+        m["foot"] = (centroid(boots & left), centroid(boots & ~left))
+        far = np.abs(np.arange(SIZE)[None, :] - cx) >= 5
+        m["arm"] = (centroid(skin & left & far), centroid(skin & ~left & far))
+    else:
+        # two boots: split at the middle of their forward extent
+        ys, xs = np.nonzero(boots)
+        if len(xs):
+            mid = (xs.min() + xs.max()) / 2
+            col = np.arange(SIZE)[None, :]
+            m["foot"] = (centroid(boots & (col < mid)), centroid(boots & (col >= mid)))
+        else:
+            m["foot"] = (None, None)
+        m["arm"] = centroid(skin)
+    return m
+
+
+def rig_frame(base_vox, labels, scale: int, base_front: dict, base_side: dict, front: dict, side: dict | None):
+    """The standing model with its parts moved to where this frame drew them."""
+    v = base_vox.copy()
+    sx = np.clip((v[:, 0] + FOOT_X * scale) // scale, 0, SIZE - 1)
+    sy = np.clip((FOOT_Y * scale - v[:, 1]) // scale, 0, SIZE - 1)
+    lab = labels[sy, sx]
+
+    def move(part, dx, dy, dz):
+        sel = lab == part
+        v[sel, 0] += int(round(dx * scale))
+        v[sel, 1] -= int(round(dy * scale))  # sprite y goes down
+        v[sel, 2] += int(round(dz * scale))
+
+    bob = front["top"] - base_front["top"]
+    hx = (front["head"][0] - base_front["head"][0]) if front["head"] and base_front["head"] else 0
+    move(HEAD, hx, bob, 0)
+    move(BODY, 0, front["neck"] - base_front["neck"], 0)
+    # feet: sideways and lift from the front picture; forward/back from the
+    # side picture, pairing the higher (lifted) boot in both
+    fz = [0.0, 0.0]
+    if side and all(side["foot"]) and all(base_side["foot"]):
+        sf = sorted(side["foot"], key=lambda c: c[1])        # higher boot first
+        bz = sum(c[0] for c in base_side["foot"]) / 2
+        if all(front["foot"]):
+            order = sorted(range(2), key=lambda i: front["foot"][i][1])  # higher front boot first
+            fz[order[0]], fz[order[1]] = sf[0][0] - bz, sf[1][0] - bz
+    for i, part in enumerate((FOOT_L, FOOT_R)):
+        f, b = front["foot"][i], base_front["foot"][i]
+        if f and b:
+            move(part, f[0] - b[0], f[1] - b[1], fz[i])
+    # hands: the side picture shows the near arm (Link's right, on the front
+    # picture's left) swinging; the far one mirrors it
+    az = (side["arm"][0] - base_side["arm"][0]) if side and side["arm"] and base_side["arm"] else 0.0
+    for i, part in enumerate((ARM_L, ARM_R)):
+        f, b = front["arm"][i], base_front["arm"][i]
+        dz = az if part == ARM_L else -az
+        if f and b:
+            move(part, f[0] - b[0], f[1] - b[1], dz)
+        else:
+            move(part, 0, 0, dz)
+    return v
+
+
 def load(frames_dirs: list[Path]):
     rows = [(d, json.loads(l)) for d in frames_dirs
             for l in (d / "frames.jsonl").read_text().splitlines() if l.strip()]
@@ -426,7 +543,24 @@ def main() -> int:
         prof = Profile(idle[RIGHT], idle[DOWN], scale)
         base = {"front": up(idle[DOWN], scale), "back": up(idle[UP][:, ::-1], scale), "side": up(idle[RIGHT], scale)}
         name = SPRITE_NAMES[sprite]
-        models[f"{name}: standing"] = [carve_base(idle[DOWN], idle[UP], idle[RIGHT], scale, prof)]
+        base_vox = carve_base(idle[DOWN], idle[UP], idle[RIGHT], scale, prof)
+        models[f"{name}: standing"] = [base_vox]
+        # rigged: the one standing model, parts moved per frame (front frame for
+        # sideways/up-down, side frame for forward/back); one model, every facing
+        labels = rig_labels(idle[DOWN])
+        bf, bs = measure(idle[DOWN], False), measure(idle[RIGHT], True)
+        for pose, anim in poses.items():
+            steps = sorted(s for (sp, an, s) in pics if sp == sprite and an == anim + DOWN)
+            seq = []
+            for st in steps:
+                sideimg = pics.get((sprite, anim + RIGHT, st))
+                v = rig_frame(base_vox, labels, scale, bf, bs, measure(pics[(sprite, anim + DOWN, st)], False),
+                              measure(sideimg, True) if sideimg is not None else None)
+                if pose == "sword":  # the blade as the front swing drew it
+                    v = np.vstack([v, blade_voxels(pics[(sprite, anim + DOWN, st)], DOWN, scale, prof)])
+                seq.append(v)
+            if seq:
+                models[f"{name}: {pose}, rigged"] = seq
         for pose, anim in poses.items():
             for d in (DOWN, RIGHT, UP):
                 steps = sorted(s for (sp, an, s) in pics if sp == sprite and an == anim + d)
