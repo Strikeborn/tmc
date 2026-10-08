@@ -17,10 +17,13 @@
  *   saved_at timestamp                       (u64 LE)
  *   bases    saved native addresses          (NUM_REGIONS u64 LE)
  *   region   ROM region tag                  (u32 LE)
+ *   layout   build layout signature          (u64 LE)
+ *   image    program image start, end        (2 x u64 LE)
  *   data     concatenated region bytes       (in sRegions[] order)
  *
  * On load, if magic/version/size don't match, the file is rejected
- * silently — the in-memory snapshot (if any) stays untouched. This is
+ * silently, and a different ROM region or build layout is refused with a
+ * log line — the in-memory snapshot (if any) stays untouched. This is
  * defensive against schema changes between builds; saves are best-effort,
  * not a contract.
  *
@@ -55,6 +58,7 @@
 #include "port_gba_mem.h"
 #include "port_runtime_config.h"
 #include "region.h" /* REGION_IS_EU/JP — per-region savestate isolation (#21) */
+#include "hitbox.h"
 
 extern u8 gEwram[];
 extern u8 gIwram[];
@@ -122,7 +126,7 @@ static StateRegion sRegions[] = {
 #define NUM_AUTO_SLOTS 3
 #define MAGIC 0x53434D54u /* "TMCS" little-endian */
 #define VERSION                                         \
-    7u /* v2: header carries gEntities base address for \
+    8u /* v2: header carries gEntities base address for \
         * cross-process pointer-fixup on restore.       \
         * v3: gRand added to region list so RNG         \
         * state round-trips (GBA had it in IWRAM).      \
@@ -136,7 +140,10 @@ static StateRegion sRegions[] = {
         * v7: entity bookkeeping and per-region bases   \
         * for relocating both nodes and list sentinels. \
         * v7 is also the first with gSave.flags at the  \
-        * retail 0x25C; v6 may hold the old PC layout. */
+        * retail 0x25C; v6 may hold the old PC layout.  \
+        * v8: build layout signature + program image    \
+        * range: states from another build are refused, \
+        * same-build pointers into the image relocated. */
 
 typedef struct {
     u8* snapshot; /* heap, NULL if slot empty */
@@ -144,6 +151,7 @@ typedef struct {
     int valid;
     u64 saved_at_unix;       /* clock_gettime CLOCK_REALTIME seconds */
     u64 saved_bases[NUM_REGIONS]; /* native addresses when captured */
+    u64 image_lo, image_hi;       /* program image when captured (0 = unknown) */
 } Slot;
 
 static Slot sSlots[NUM_SLOTS];
@@ -161,6 +169,44 @@ static u32 sAutoIntervalMs = 60000; /* 60 seconds default */
 static int sAutoOnAreaChange = 1;
 static u8 sLastSeenArea = 0xFF;
 static u8 sLastSeenRoom = 0xFF;
+
+/* The program image: code, constants and statics. Entities point into it
+ * (hitboxes, scripts, animation tables) and it moves as a whole when the OS
+ * loads the program somewhere else (ASLR, e.g. after a reboot), so a state
+ * from an earlier process relocates those pointers by the image's shift. */
+#if defined(_WIN32)
+extern char __ImageBase[];
+static void ImageRange(u64* lo, u64* hi) {
+    /* PE: e_lfanew at 0x3C; SizeOfImage 56 bytes into the optional header,
+     * which follows the 4-byte signature and the 20-byte file header. */
+    u32 peOffset, sizeOfImage;
+    memcpy(&peOffset, __ImageBase + 0x3C, sizeof(peOffset));
+    memcpy(&sizeOfImage, __ImageBase + peOffset + 4 + 20 + 56, sizeof(sizeOfImage));
+    *lo = (u64)(uintptr_t)__ImageBase;
+    *hi = *lo + sizeOfImage;
+}
+#elif defined(__linux__) && !defined(__ANDROID__)
+extern char __executable_start[], _end[];
+static void ImageRange(u64* lo, u64* hi) {
+    *lo = (u64)(uintptr_t)__executable_start;
+    *hi = (u64)(uintptr_t)_end;
+}
+#else
+static void ImageRange(u64* lo, u64* hi) {
+    *lo = *hi = 0; /* unknown: no image relocation */
+}
+#endif
+
+/* Differs between builds whose code or data moved relative to each other:
+ * a state holds raw pointers into that layout, so only the build that wrote
+ * it can read it back. */
+static u64 LayoutSignature(void) {
+    u64 lo, hi;
+    ImageRange(&lo, &hi);
+    const uintptr_t base = (uintptr_t)gEwram;
+    return ((u64)((uintptr_t)&gPlayerHitbox - base) * 1000003u) ^
+           ((u64)((uintptr_t)&LayoutSignature - base) << 20) ^ (hi - lo);
+}
 
 static size_t TotalRegionBytes(void) {
     size_t total = 0;
@@ -189,6 +235,7 @@ static int Snapshot_Capture(Slot* s) {
         dst += sRegions[i].size;
         s->saved_bases[i] = (u64)(uintptr_t)sRegions[i].ptr;
     }
+    ImageRange(&s->image_lo, &s->image_hi);
     s->valid = 1;
     s->saved_at_unix = (u64)time(NULL);
     return 1;
@@ -231,6 +278,9 @@ static int Snapshot_MatchesCurrent(const Slot* s, const char** region, size_t* o
  * range; raw emulated memory and integer-only globals are never scanned.
  * This does not serialize arbitrary heap allocations or asset pointers. */
 static void FixupEntityPointers(const Slot* s) {
+    u64 imageLo, imageHi;
+    ImageRange(&imageLo, &imageHi);
+    const int moveImage = s->image_lo != 0 && imageLo != 0 && s->image_lo != imageLo;
     for (size_t i = 0; i < NUM_REGIONS; ++i) {
         if (!sRegions[i].hasPointers)
             continue;
@@ -244,6 +294,10 @@ static void FixupEntityPointers(const Slot* s) {
                     value = (uintptr_t)sRegions[target].ptr + (uintptr_t)(value - base);
                     memcpy(bytes + offset, &value, sizeof(value));
                     break;
+                }
+                if (target + 1 == NUM_REGIONS && moveImage && value >= s->image_lo && value < s->image_hi) {
+                    value = (uintptr_t)(imageLo + (value - s->image_lo));
+                    memcpy(bytes + offset, &value, sizeof(value));
                 }
             }
         }
@@ -399,10 +453,12 @@ static int WriteSlotToDisk(int slot) {
     const u32 total = (u32)s->bytes;
     const u64 saved_at = s->saved_at_unix;
     const u32 region_tag = ActiveRegionTag();
+    const u64 layout = LayoutSignature();
     if (fwrite(&magic, sizeof(magic), 1, f) != 1 || fwrite(&version, sizeof(version), 1, f) != 1 ||
         fwrite(&total, sizeof(total), 1, f) != 1 || fwrite(&saved_at, sizeof(saved_at), 1, f) != 1 ||
         fwrite(s->saved_bases, sizeof(s->saved_bases), 1, f) != 1 ||
-        fwrite(&region_tag, sizeof(region_tag), 1, f) != 1) {
+        fwrite(&region_tag, sizeof(region_tag), 1, f) != 1 || fwrite(&layout, sizeof(layout), 1, f) != 1 ||
+        fwrite(&s->image_lo, sizeof(s->image_lo), 1, f) != 1 || fwrite(&s->image_hi, sizeof(s->image_hi), 1, f) != 1) {
         fprintf(stderr, "[quicksave] header write failed for %s\n", path);
         fclose(f);
         return 0;
@@ -463,6 +519,20 @@ static int ReadSlotFromDisk(int slot) {
             return 0;
         }
     }
+    u64 layout = 0, image_lo = 0, image_hi = 0;
+    if (fread(&layout, sizeof(layout), 1, f) != 1 || fread(&image_lo, sizeof(image_lo), 1, f) != 1 ||
+        fread(&image_hi, sizeof(image_hi), 1, f) != 1) {
+        fprintf(stderr, "[quicksave] short read on %s build header, ignoring slot file\n", path);
+        fclose(f);
+        return 0;
+    }
+    if (layout != LayoutSignature()) {
+        /* Its pointers into code and constants belong to another build's
+         * layout; restoring it would crash on the first one followed. */
+        fprintf(stderr, "[quicksave] %s was saved by a different build of the game — refusing load\n", path);
+        fclose(f);
+        return 0;
+    }
     Slot* s = &sSlots[slot];
     if (s->snapshot == NULL || s->bytes != total) {
         free(s->snapshot);
@@ -485,6 +555,7 @@ static int ReadSlotFromDisk(int slot) {
     s->valid = 1;
     s->saved_at_unix = saved_at;
     memcpy(s->saved_bases, saved_bases, sizeof(saved_bases));
+    s->image_lo = image_lo, s->image_hi = image_hi;
     return 1;
 }
 
@@ -634,6 +705,17 @@ static void TakeAutoSnapshot(const char* reason) {
 }
 
 void Port_QuickSave_AutoTick(void) {
+    {
+        /* ponytail: debug knob — TMC_REPRO_LOAD_SLOT=<n>: load state slot n
+         * from the title screen, as the menu's resume does (crash repros). */
+        static int titleFrames = 0, done = 0;
+        const char* ls = getenv("TMC_REPRO_LOAD_SLOT");
+        if (ls && *ls && !done && gMain.task == TASK_TITLE && ++titleFrames > 90) {
+            done = 1;
+            fprintf(stderr, "[quicksave] repro: loading slot %d from title -> %d\n", atoi(ls),
+                    Port_QuickSave_LoadSlot(atoi(ls)));
+        }
+    }
     if (QuickSaveReplayTestTick() || !sAutoEnabled)
         return;
     const u64 now = SDL_GetTicks();
