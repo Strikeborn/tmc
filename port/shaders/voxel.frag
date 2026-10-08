@@ -151,7 +151,7 @@ void main() {
     // bit30 bark: the trunk's browns cooled toward a soft blue-grey, lifted
     if (vParams.x == 0u && (vParams.w & 0x40000000u) != 0u) {
         float g = dot(rgb, vec3(0.3, 0.59, 0.11));
-        rgb = mix(rgb, g * vec3(0.88, 0.94, 1.08), 0.6) * 1.15 + vec3(0.05, 0.06, 0.08);
+        rgb = mix(rgb, g * vec3(0.9, 0.94, 1.06), 0.35) * 1.15 + vec3(0.04, 0.04, 0.05);
     }
     if (vParams.x == 0u && (vParams.w & 0x80000000u) != 0u)
         rgb *= faceShade();

@@ -353,9 +353,11 @@ constexpr int kMaxMapVerts = (64 * 64 * 8 + 112 * 112 * 2) * 6 + 6000000; /* ~23
 Vert sMapVerts[kMaxMapVerts];
 int sMapVertCount = 0;
 Uint64 sMapKey = 0;
-constexpr int kMaxProps = 256;
-Uint8 sMaskPixels[256 * 256];
-bool sPropOutlined[256]; /* per prop mask slot: from its closed outline (round), not its ground */
+constexpr int kMaskRows = 512; /* mask atlas: 256 x 512, 16 x 32 slots of 16 x 16 */
+constexpr int kMaxProps = 510;  /* params carry slot + 1 in 9 bits */
+Uint8 sMaskPixels[256 * kMaskRows];
+bool sPropOutlined[kMaxProps]; /* per prop mask slot: from its closed outline (round), not its ground */
+bool sPropCutout[kMaxProps];   /* per prop mask slot: a structure cut from its ground (fence post, rail) */
 int sPropCount = 0;
 uint32_t sBg0Pixels[MODE1_GBA_WIDTH * 480];
 
@@ -459,7 +461,7 @@ bool Init(void) {
     sMapTex = MakeTex(SDL_GPU_TEXTUREFORMAT_R16_UINT, 128, 256, samp);
     sPalTex = MakeTex(SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, 512, 1, samp);
     sBg0Tex = MakeTex(SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, MODE1_GBA_WIDTH, 480, samp);
-    sMaskTex = MakeTex(SDL_GPU_TEXTUREFORMAT_R8_UNORM, 256, 256, samp);
+    sMaskTex = MakeTex(SDL_GPU_TEXTUREFORMAT_R8_UNORM, 256, kMaskRows, samp);
 
     SDL_GPUBufferCreateInfo bci = {};
     bci.usage = SDL_GPU_BUFFERUSAGE_VERTEX;
@@ -855,6 +857,8 @@ bool Dark555(int c) {
 /* Builds the outlined-object mask of a 16x16 tile, read through `pix`
  * (px, py) -> RGB555 or -1 for transparent, into atlas slot `slot`; false if
  * the tile doesn't read as an outlined object (no enclosed region, or all). */
+void DropShadowMass(bool obj[256], const int col[256]);
+
 template <typename Pix> bool BuildMask(Pix pix, int slot, int minCount = 24) {
     bool outline[256], reached[256] = {};
     for (int i = 0; i < 256; ++i) {
@@ -878,14 +882,19 @@ template <typename Pix> bool BuildMask(Pix pix, int slot, int minCount = 24) {
                 stack[sp++] = j;
             }
     }
-    int count = 0;
+    /* a cast shadow enclosed with the object isn't part of it */
+    bool obj[256];
+    int col[256], count = 0;
     for (int i = 0; i < 256; ++i)
-        count += !reached[i];
+        obj[i] = !reached[i], col[i] = pix(i & 15, i >> 4);
+    DropShadowMass(obj, col);
+    for (int i = 0; i < 256; ++i)
+        count += obj[i];
     if (count < minCount || count > 240)
         return false;
     const int ox = (slot % 16) * 16, oy = (slot / 16) * 16;
     for (int i = 0; i < 256; ++i)
-        sMaskPixels[(oy + (i >> 4)) * 256 + ox + (i & 15)] = reached[i] ? 0 : 255;
+        sMaskPixels[(oy + (i >> 4)) * 256 + ox + (i & 15)] = obj[i] ? 255 : 0;
     return true;
 }
 
@@ -898,6 +907,31 @@ bool BuildPropMask(int x, int y, int slot, Uint32 charBase, bool bpp8) {
  * a differently arranged grass background still reads as ground. Fails when
  * that is most of the tile (not an object on that ground) or too little to
  * see. */
+/* A cast shadow on the ground is near-black too, like an object's outline:
+ * keep a near-black object pixel only where it touches a lighter one (the
+ * outline round a body); a shadow's dark mass goes. */
+void DropShadowMass(bool obj[256], const int col[256]) {
+    bool keep[256];
+    for (int i = 0; i < 256; ++i) {
+        keep[i] = obj[i];
+        if (!obj[i] || col[i] < 0 || !Dark555(col[i]))
+            continue;
+        const int c = i & 15, r = i >> 4;
+        bool touches = false;
+        static const int d[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+        for (const auto& k : d) {
+            const int nc = c + k[0], nr = r + k[1];
+            if (nc < 0 || nc > 15 || nr < 0 || nr > 15)
+                continue;
+            const int j = nr * 16 + nc;
+            touches |= obj[j] && col[j] >= 0 && !Dark555(col[j]);
+        }
+        keep[i] = touches;
+    }
+    for (int i = 0; i < 256; ++i)
+        obj[i] = keep[i];
+}
+
 bool BuildDiffMask(int x, int y, int ux, int uy, int slot, Uint32 charBase, bool bpp8, int* outCount = nullptr) {
     int ground[256], ng = 0;
     for (int i = 0; i < 256; ++i) {
@@ -917,12 +951,14 @@ bool BuildDiffMask(int x, int y, int ux, int uy, int slot, Uint32 charBase, bool
         return g > r && g > b && bright(c) < groundDark && !Dark555(c);
     };
     bool obj[256];
-    int count = 0;
+    int col[256], count = 0;
     for (int i = 0; i < 256; ++i) {
-        const int c = BottomPixel(x, y, i & 15, i >> 4, charBase, bpp8);
+        const int c = col[i] = BottomPixel(x, y, i & 15, i >> 4, charBase, bpp8);
         obj[i] = std::find(ground, ground + ng, c) == ground + ng && !shadow(c);
-        count += obj[i];
     }
+    DropShadowMass(obj, col);
+    for (int i = 0; i < 256; ++i)
+        count += obj[i];
     if (outCount)
         *outCount = count;
     if (count < 24 || count > 200)
@@ -979,6 +1015,7 @@ void BuildMap(void) {
     const int wallTiles = sBuildShapes ? sBuildShapes->wall : kDefaultWallTiles;
     sPropCount = 0;
     std::memset(sMaskPixels, 0, sizeof(sMaskPixels));
+    std::memset(sPropCutout, 0, sizeof(sPropCutout));
     const int W = gRoomControls.width / 16, H = gRoomControls.height / 16;
     const u16 cb = LayerCnt(gMapBottom.bgSettings);
     const Uint32 bChar = ((cb >> 2) & 3u) * 0x4000u, b8 = (cb & 0x80) ? 1u : 0u;
@@ -1259,6 +1296,93 @@ void BuildMap(void) {
         };
         auto pix = [&](int c, int r) { return BottomPixel(x, y, c, r, bChar, b8 != 0); };
         auto brown = [&](int p) { return p >= 0 && (p & 31) > ((p >> 5) & 31); }; /* red over green: soil, wood */
+        /* A structure cut from its ground (a fence post, a rail), read off
+         * the 2D view: it stands on the ground at its art's bottom row; each
+         * art row is that many px up; a narrow run of a row (a post) turns
+         * round, a wide one (a rail, a plank) is a 3-px-deep slab. */
+        if (sPropCutout[slot - 1]) {
+            int rB = -1;
+            for (int r = 0; r < 16; ++r)
+                for (int c = 0; c < 16; ++c)
+                    if (on(c, r))
+                        rB = std::max(rB, r);
+            if (rB < 0)
+                return;
+            static Sint16 cs[16][16][16]; /* [h][x][z]: art pixel r * 16 + c, -1 empty */
+            std::memset(cs, -1, sizeof(cs));
+            /* the posts' radius: the narrowest runs' half width (its body) */
+            const float zc = std::min(15.5f, rB + 0.5f - 2.5f);
+            for (int r = 0; r <= rB; ++r) {
+                const int h = rB - r;
+                for (int c = 0; c < 16;) {
+                    if (!on(c, r)) {
+                        ++c;
+                        continue;
+                    }
+                    int e = c;
+                    while (e + 1 < 16 && on(e + 1, r))
+                        ++e;
+                    const int w = e - c + 1;
+                    const float cx = (c + e + 1) * 0.5f;
+                    for (int vx = 0; vx < 16; ++vx)
+                        for (int vz = 0; vz < 16; ++vz) {
+                            const float fx = vx + 0.5f, fz = vz + 0.5f;
+                            bool in;
+                            if (w <= 6) /* post: round */
+                                in = std::hypot(fx - cx, fz - zc) <= w * 0.5f + 0.25f;
+                            else /* rail: a slab */
+                                in = vx >= c && vx <= e && std::fabs(fz - zc) <= 1.5f;
+                            if (in && cs[h][vx][vz] < 0)
+                                cs[h][vx][vz] = (Sint16)(r * 16 + std::clamp(vx, c, e));
+                        }
+                    c = e + 1;
+                }
+            }
+            auto at = [&](int h, int vx, int vz) {
+                return h >= 0 && h < 16 && vx >= 0 && vx < 16 && vz >= 0 && vz < 16 && cs[h][vx][vz] >= 0;
+            };
+            const Uint32 params = baseParams(0, 0);
+            for (int h = 0; h < 16; ++h)
+                for (int vx = 0; vx < 16; ++vx)
+                    for (int vz = 0; vz < 16; ++vz) {
+                        const int sp = cs[h][vx][vz];
+                        if (sp < 0)
+                            continue;
+                        /* tops wear the row above (a post's cap), sides their own row */
+                        const int spTop = at(h + 1, vx, vz) ? sp : (sp >= 16 && on(sp & 15, (sp >> 4) - 1) ? sp - 16 : sp);
+                        const float px = x * 16.0f + vx, pz = y * 16.0f + vz, px1 = px + 1, pz1 = pz + 1, bot = (float)h,
+                                    top = bot + 1;
+                        auto face = [&](const float (&q)[4][3], int pp) {
+                            const float u = x * 16.0f + (pp & 15) + 0.5f, v = y * 16.0f + (pp >> 4) + 0.5f;
+                            Quad(sMapVerts, kMaxMapVerts, n, q, u, v, u, v, 0, 0u, bChar, params);
+                        };
+                        if (!at(h + 1, vx, vz)) {
+                            const float q[4][3] = { { px, top, pz }, { px1, top, pz }, { px, top, pz1 }, { px1, top, pz1 } };
+                            face(q, spTop);
+                        }
+                        if (h > 0 && !at(h - 1, vx, vz)) {
+                            const float q[4][3] = { { px, bot, pz1 }, { px1, bot, pz1 }, { px, bot, pz }, { px1, bot, pz } };
+                            face(q, sp);
+                        }
+                        if (!at(h, vx, vz + 1)) {
+                            const float q[4][3] = { { px, top, pz1 }, { px1, top, pz1 }, { px, bot, pz1 }, { px1, bot, pz1 } };
+                            face(q, sp);
+                        }
+                        if (!at(h, vx, vz - 1)) {
+                            const float q[4][3] = { { px1, top, pz }, { px, top, pz }, { px1, bot, pz }, { px, bot, pz } };
+                            face(q, sp);
+                        }
+                        if (!at(h, vx - 1, vz)) {
+                            const float q[4][3] = { { px, top, pz }, { px, top, pz1 }, { px, bot, pz }, { px, bot, pz1 } };
+                            face(q, sp);
+                        }
+                        if (!at(h, vx + 1, vz)) {
+                            const float q[4][3] = { { px1, top, pz1 }, { px1, top, pz }, { px1, bot, pz1 }, { px1, bot, pz } };
+                            face(q, sp);
+                        }
+                    }
+            return;
+        }
         /* Every voxel remembers the art pixel it wears. */
         static Sint8 srcC[16][16][16], srcR[16][16][16]; /* [row][vx][vz], -1 = empty */
         std::memset(srcC, -1, sizeof(srcC));
@@ -1742,6 +1866,85 @@ void BuildMap(void) {
     auto joins = [&](int x, int y, int nx, int ny) {
         return Geom(nx, ny) && BottomTileType(ny * 64 + nx) == BottomTileType(y * 64 + x);
     };
+    /* A structure in a line (fence posts, rails) that still shows ground
+     * round it: what differs from the ground beside it stands up as itself,
+     * not a box. A wall or cliff filling its tile stays a box. On success the
+     * mask is slot sPropCount - 1. */
+    /* mostly green art: leaves (a bush), not a post on grass */
+    auto leafyArt = [&](int x, int y) {
+        int g = 0, all = 0;
+        for (int i = 0; i < 256; i += 2) {
+            const int c = BottomPixel(x, y, i & 15, i >> 4, bChar, b8 != 0);
+            if (c < 0)
+                continue;
+            ++all;
+            const int r = c & 31, gg = (c >> 5) & 31, b = (c >> 10) & 31;
+            g += gg > r && gg > b && !Dark555(c);
+        }
+        return all > 0 && g * 10 >= all * 6;
+    };
+    auto tryCutout = [&](int x, int y) -> bool {
+        if (std::getenv("TMC_VOXEL_DUMPMAP"))
+            std::fprintf(stderr, "[voxel-cut] %d,%d try cover %d foliage %d\n", x, y, Cover(x, y), (int)Foliage(x, y));
+        if (!outdoors || Cover(x, y) || sPropCount >= kMaxProps)
+            return false;
+        /* it stands on dry ground: a walkable, unsunk neighbour (rocks in a
+         * river stay as they are) */
+        {
+            bool dry = false;
+            static const int kNb3[4][2] = { { -1, 0 }, { 1, 0 }, { 0, 1 }, { 0, -1 } };
+            for (const auto& d : kNb3) {
+                const int nx = x + d[0], ny = y + d[1];
+                dry |= inRoom(nx, ny) && !Geom(nx, ny) && SinkDepth(nx, ny) == 0.0f &&
+                       gMapBottom.collisionData[ny * 64 + nx] == 0;
+            }
+            if (!dry)
+                return false;
+        }
+        /* ground: every colour of the walkable, uncovered tiles within two
+         * (grass comes in variants), plus the room's commonest ground */
+        int ground[256], ng = 0;
+        auto addGround = [&](int gx, int gy, bool anySolid = false) {
+            if (!inRoom(gx, gy) || (Geom(gx, gy) && !anySolid) || Cover(gx, gy) || SinkDepth(gx, gy) != 0.0f)
+                return;
+            for (int i = 0; i < 256 && ng < 256; ++i) {
+                const int c = BottomPixel(gx, gy, i & 15, i >> 4, bChar, b8 != 0);
+                if (std::find(ground, ground + ng, c) == ground + ng)
+                    ground[ng++] = c;
+            }
+        };
+        for (int dy = -2; dy <= 2; ++dy)
+            for (int dx = -2; dx <= 2; ++dx)
+                if (dx || dy)
+                    addGround(x + dx, y + dy);
+        if (groundX >= 0)
+            addGround(groundX, groundY);
+        /* a fence along a cliff's top stands on the cliff's dirt */
+        if (inRoom(x, y + 1) && Geom(x, y + 1) && BottomTileType((y + 1) * 64 + x) != BottomTileType(y * 64 + x))
+            addGround(x, y + 1, true);
+        if (ng == 0)
+            return false;
+        bool obj[256];
+        int col[256], count = 0;
+        for (int i = 0; i < 256; ++i) {
+            const int c = col[i] = BottomPixel(x, y, i & 15, i >> 4, bChar, b8 != 0);
+            obj[i] = c >= 0 && std::find(ground, ground + ng, c) == ground + ng;
+        }
+        DropShadowMass(obj, col);
+        for (int i = 0; i < 256; ++i)
+            count += obj[i];
+        if (std::getenv("TMC_VOXEL_DUMPMAP"))
+            std::fprintf(stderr, "[voxel-cut] %d,%d ground colours %d object %d\n", x, y, ng, count);
+        if (count < 24 || count > 210)
+            return false;
+        const int ox = (sPropCount % 16) * 16, oy = (sPropCount / 16) * 16;
+        for (int i = 0; i < 256; ++i)
+            sMaskPixels[(oy + (i >> 4)) * 256 + ox + (i & 15)] = obj[i] ? 255 : 0;
+        sPropOutlined[sPropCount] = false;
+        sPropCutout[sPropCount] = true;
+        ++sPropCount;
+        return true;
+    };
     auto isProp = [&](int x, int y) -> bool {
         const int ov = TileOverride(y * 64 + x);
         if (ov == PORT_VOXEL_SHAPE_FLOOR || ov == PORT_VOXEL_SHAPE_BLOCK || sPropCount >= kMaxProps ||
@@ -1753,11 +1956,14 @@ void BuildMap(void) {
              * is still its own object: leafy art fully outlined inside the
              * tile. (Ledges, fences and doors outline too, so foliage only.) */
             if (joins(x, y, x, y - 1) || joins(x, y, x, y + 1) || joins(x, y, x - 1, y) || joins(x, y, x + 1, y)) {
-                if (Cover(x, y) || !outdoors || !Foliage(x, y) || !BuildPropMask(x, y, sPropCount, bChar, b8 != 0))
+                if (Cover(x, y) || !outdoors)
                     return false;
-                sPropOutlined[sPropCount] = true;
-                ++sPropCount;
-                return true;
+                if (Foliage(x, y) && leafyArt(x, y) && BuildPropMask(x, y, sPropCount, bChar, b8 != 0)) {
+                    sPropOutlined[sPropCount] = true;
+                    ++sPropCount;
+                    return true;
+                }
+                return tryCutout(x, y);
             }
             /* Touching another kind of solid (a sapling against a trunk):
              * the tests below decide. */
@@ -2008,8 +2214,11 @@ void BuildMap(void) {
              * its own prop: the run ends below it (the scan skips it next).
              * Only on top of trees: walls change type row to row too. */
             while (y >= 0 && Geom(x, y) && !inTree(x, y)) {
-                if (BottomTileType(y * 64 + x) != BottomTileType((y + 1) * 64 + x) && outdoors &&
-                    (Cover(x, y + 1) || Foliage(x, y + 1)) && isProp(x, y)) {
+                const bool newType = BottomTileType(y * 64 + x) != BottomTileType((y + 1) * 64 + x) && outdoors;
+                if (newType && (((Cover(x, y + 1) || Foliage(x, y + 1)) && isProp(x, y)) ||
+                                /* a fence standing on a cliff's top */
+                                (joins(x, y, x - 1, y) || joins(x, y, x + 1, y) || joins(x, y, x, y - 1)) &&
+                                    tryCutout(x, y))) {
                     kind[y * 64 + x] = 1;
                     propSlot[y * 64 + x] = (Uint32)sPropCount;
                     break;
@@ -3153,11 +3362,11 @@ static bool PresentImpl(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swap, int swa
             ksrc.transfer_buffer = sMapXfer;
             ksrc.offset = (Uint32)sizeof(sMapVerts);
             ksrc.pixels_per_row = 256;
-            ksrc.rows_per_layer = 256;
+            ksrc.rows_per_layer = kMaskRows;
             SDL_GPUTextureRegion kdst = {};
             kdst.texture = sMaskTex;
             kdst.w = 256;
-            kdst.h = 256;
+            kdst.h = kMaskRows;
             kdst.d = 1;
             SDL_UploadToGPUTexture(cp, &ksrc, &kdst, false);
         }
