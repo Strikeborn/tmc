@@ -698,6 +698,10 @@ def build_version(version: str, env: dict, non_interactive: bool = False,
     if PLATFORM != "Windows":
         dst_bin.chmod(dst_bin.stat().st_mode | 0o111)
     ok(f"Binary    →  dist/{version}/{EXE_NAME}")
+    # Symbol table beside the binary: lets save states load in later builds.
+    src_syms = src_bin.parent / "tmc_pc.syms"
+    if src_syms.exists():
+        shutil.copy2(src_syms, dist_dir / "tmc_pc.syms")
 
     # Linux: bundle libSDL3 + libgomp so the tarball runs on systems
     # that don't ship SDL3 yet (Steam Deck SteamOS, older Ubuntu/Fedora).

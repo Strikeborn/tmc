@@ -745,6 +745,7 @@ target("tmc_pc")
     add_files("port/port_update_check.c")
     add_files("port/port_asset_loader.cpp")
     add_files("port/port_ptr_registry.c")  -- named heap blocks for portable save states
+    add_files("port/port_syms.c")  -- tmc_pc.syms reader: save-state pointers by symbol
     add_files("port/port_asset_pipeline.cpp")
     add_files("port/port_asset_log.cpp")
     add_files("port/port_asset_pak.cpp")
@@ -1117,6 +1118,39 @@ target("tmc_pc")
     -- locally (CI release tarballs may strip later). The xmake mode.release
     -- rule adds -s/--strip-all by default which makes addr2line useless.
     set_strip("none")
+
+    -- tmc_pc.syms beside the binary: every code/data symbol as "<link-time
+    -- address hex> <name>". Save states name pointers into code and constants by
+    -- symbol so later builds can load them (port/port_syms.c). Repeated
+    -- static names get #2, #3... in address order. Skipped without nm.
+    after_build(function (target)
+        if is_plat("android") then
+            return
+        end
+        import("lib.detect.find_tool")
+        local nm = find_tool("nm")
+        if not nm then
+            return
+        end
+        local out = try { function ()
+            return os.iorunv(nm.program, {"-n", "--defined-only", target:targetfile()})
+        end }
+        if not out then
+            return
+        end
+        local seen, lines = {}, {"# link-time address, name (port/port_syms.c)"}
+        for line in out:gmatch("[^\r\n]+") do
+            local addr, kind, name = line:match("^(%x+)%s+(%a)%s+(%S+)$")
+            if addr and kind:match("[TtRrDdBb]") then
+                seen[name] = (seen[name] or 0) + 1
+                if seen[name] > 1 then
+                    name = name .. "#" .. seen[name]
+                end
+                table.insert(lines, addr .. " " .. name)
+            end
+        end
+        io.writefile(path.join(target:targetdir(), "tmc_pc.syms"), table.concat(lines, "\n") .. "\n")
+    end)
 target_end()
 
 -- ====================

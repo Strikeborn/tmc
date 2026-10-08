@@ -15,16 +15,19 @@
  *   version  PORT_QUICKSAVE_VERSION          (u32 LE)
  *   total    sum of all region sizes         (u32 LE)
  *   saved_at timestamp                       (u64 LE)
- *   bases    saved native addresses          (NUM_REGIONS u64 LE)
  *   region   ROM region tag                  (u32 LE)
  *   layout   build layout signature          (u64 LE)
  *   image    program image start, end        (2 x u64 LE)
- *   pointers heap/ROM pointer records         (u32 count + records)
- *   data     concatenated region bytes       (in sRegions[] order)
+ *   portable every code/constant pointer named (u32 LE)
+ *   regions  directory: name, size, address  (u32 count + entries)
+ *   pointers ROM/heap/symbol pointer records (u32 count + records)
+ *   data     concatenated region bytes       (in directory order)
  *
- * On load, if magic/version/size don't match, the file is rejected
- * silently, and a different ROM region or build layout is refused with a
- * log line — the in-memory snapshot (if any) stays untouched. This is
+ * On load, if magic/version don't match, the file is rejected silently; a
+ * different ROM region, or another build when the state isn't portable
+ * (or tmc_pc.syms is missing), or a shared region that changed size, is
+ * refused with a log line — the in-memory snapshot (if any) stays
+ * untouched. This is
  * defensive against schema changes between builds; saves are best-effort,
  * not a contract.
  *
@@ -83,6 +86,7 @@
 #include "scroll.h"
 #include "port_voxel.h"
 #include "port_ptr_registry.h"
+#include "port_syms.h"
 extern int Port_CaptureBaseFramebufferPNG(const char* path);
 
 extern u8 gEwram[];
@@ -175,7 +179,7 @@ static StateRegion sRegions[] = {
 #define NUM_AUTO_SLOTS 3
 #define MAGIC 0x53434D54u /* "TMCS" little-endian */
 #define VERSION                                         \
-    10u /* v2: header carries gEntities base address for \
+    11u /* v2: header carries gEntities base address for \
         * cross-process pointer-fixup on restore.       \
         * v3: gRand added to region list so RNG         \
         * state round-trips (GBA had it in IWRAM).      \
@@ -194,7 +198,12 @@ static StateRegion sRegions[] = {
         * range: states from another build are refused, \
         * same-build pointers into the image relocated. \
         * v9: every game RAM global (linker.ld), not    \
-        * only the entity pools: maps, area, scripts... \n        * v10: pointer table: pointers into the ROM and \n        * named heap blocks, resolved again on load. */
+        * only the entity pools: maps, area, scripts... \
+        * v10: pointer table: pointers into the ROM and \
+        * named heap blocks, resolved again on load.    \
+        * v11: regions by name, pointers into code and  \
+        * constants by symbol (tmc_pc.syms): states     \
+        * load in later builds. */
 
 typedef struct {
     u8* snapshot; /* heap, NULL if slot empty */
@@ -203,22 +212,23 @@ typedef struct {
     u64 saved_at_unix;       /* clock_gettime CLOCK_REALTIME seconds */
     u64 saved_bases[NUM_REGIONS]; /* native addresses when captured */
     u64 image_lo, image_hi;       /* program image when captured (0 = unknown) */
-    struct PtrRec* recs;          /* pointers into the ROM and named heap blocks */
+    struct PtrRec* recs;          /* pointers into the ROM, named heap blocks, code */
     u32 nrecs;
+    int portable;                 /* every pointer into code/constants has a symbol */
 } Slot;
 
 /* A pointer the region/image relocation can't fix: into the ROM buffer or a
  * named heap block (asset file, area table...; port_ptr_registry). Recorded by
  * what it points at, resolved again on restore, so it survives a new process
  * where those buffers sit elsewhere or aren't loaded yet. */
-enum { PTR_ROM = 1, PTR_BLOCK = 2 };
+enum { PTR_ROM = 1, PTR_BLOCK = 2, PTR_SYMBOL = 3 };
 typedef struct PtrRec {
     u16 region;     /* sRegions index holding the pointer */
-    u8 kind;        /* PTR_ROM / PTR_BLOCK */
-    u8 keyLen;      /* PTR_BLOCK: bytes of key */
+    u8 kind;        /* PTR_ROM / PTR_BLOCK / PTR_SYMBOL */
+    u8 keyLen;      /* PTR_BLOCK / PTR_SYMBOL: bytes of key */
     u32 at;         /* offset of the pointer in that region */
-    u64 offset;     /* into the ROM / the block */
-    char key[112];  /* PTR_BLOCK: block name */
+    u64 offset;     /* into the ROM / the block / the symbol */
+    char key[112];  /* PTR_BLOCK: block name, PTR_SYMBOL: symbol name */
 } PtrRec;
 
 static Slot sSlots[NUM_SLOTS];
@@ -300,6 +310,8 @@ static void RecordHeapPointers(Slot* s) {
     u32 n = 0, cap = s->nrecs;
     u64 imageLo, imageHi;
     ImageRange(&imageLo, &imageHi);
+    const int syms = Port_Syms_Available();
+    s->portable = syms;
     for (size_t i = 0; i < NUM_REGIONS; ++i) {
         if (!sRegions[i].hasPointers)
             continue;
@@ -307,13 +319,23 @@ static void RecordHeapPointers(Slot* s) {
         for (size_t off = 0; off + sizeof(uintptr_t) <= sRegions[i].size; off += sizeof(uintptr_t)) {
             uintptr_t v;
             memcpy(&v, bytes + off, sizeof(v));
-            if (v < 0x10000 || (v >= imageLo && v < imageHi) || InCapturedRegion(v))
+            if (v < 0x10000 || InCapturedRegion(v))
                 continue;
             PtrRec r;
             memset(&r, 0, sizeof(r));
             const char* key;
             size_t boff;
-            if (gRomData && v >= (uintptr_t)gRomData && v - (uintptr_t)gRomData < gRomSize) {
+            if (v >= imageLo && v < imageHi) {
+                /* code or constants: by symbol, so another build can find it */
+                u64 soff;
+                const size_t len = syms && Port_Syms_Lookup((const void*)v, &key, &soff) ? strlen(key) : 0;
+                if (len == 0 || len >= sizeof(r.key)) {
+                    s->portable = 0;
+                    continue;
+                }
+                r.kind = PTR_SYMBOL, r.offset = soff, r.keyLen = (u8)len;
+                memcpy(r.key, key, len);
+            } else if (gRomData && v >= (uintptr_t)gRomData && v - (uintptr_t)gRomData < gRomSize) {
                 r.kind = PTR_ROM, r.offset = v - (uintptr_t)gRomData;
             } else if (Port_PtrBlock_Lookup((const void*)v, &key, &boff)) {
                 const size_t len = strlen(key);
@@ -349,11 +371,16 @@ static void ResolveHeapPointers(const Slot* s) {
         void* p = NULL;
         if (r->kind == PTR_ROM) {
             p = gRomData && r->offset < gRomSize ? gRomData + r->offset : NULL;
-        } else if (r->kind == PTR_BLOCK) {
+        } else {
             char key[sizeof(r->key) + 1];
             memcpy(key, r->key, r->keyLen);
             key[r->keyLen] = 0;
-            p = Port_PtrBlock_Resolve(key, (size_t)r->offset);
+            if (r->kind == PTR_BLOCK) {
+                p = Port_PtrBlock_Resolve(key, (size_t)r->offset);
+            } else if (r->kind == PTR_SYMBOL) {
+                u8* sym = (u8*)Port_Syms_Resolve(key);
+                p = sym ? sym + r->offset : NULL;
+            }
         }
         lost += p == NULL;
         const uintptr_t v = (uintptr_t)p;
@@ -660,36 +687,35 @@ static int WriteSlotToDisk(int slot) {
     const u64 saved_at = s->saved_at_unix;
     const u32 region_tag = ActiveRegionTag();
     const u64 layout = LayoutSignature();
-    if (fwrite(&magic, sizeof(magic), 1, f) != 1 || fwrite(&version, sizeof(version), 1, f) != 1 ||
-        fwrite(&total, sizeof(total), 1, f) != 1 || fwrite(&saved_at, sizeof(saved_at), 1, f) != 1 ||
-        fwrite(s->saved_bases, sizeof(s->saved_bases), 1, f) != 1 ||
-        fwrite(&region_tag, sizeof(region_tag), 1, f) != 1 || fwrite(&layout, sizeof(layout), 1, f) != 1 ||
-        fwrite(&s->image_lo, sizeof(s->image_lo), 1, f) != 1 || fwrite(&s->image_hi, sizeof(s->image_hi), 1, f) != 1) {
-        fprintf(stderr, "[quicksave] header write failed for %s\n", path);
-        fclose(f);
-        return 0;
+    const u32 portable = (u32)s->portable;
+    const u32 nregions = (u32)NUM_REGIONS;
+    int ok = fwrite(&magic, sizeof(magic), 1, f) == 1 && fwrite(&version, sizeof(version), 1, f) == 1 &&
+             fwrite(&total, sizeof(total), 1, f) == 1 && fwrite(&saved_at, sizeof(saved_at), 1, f) == 1 &&
+             fwrite(&region_tag, sizeof(region_tag), 1, f) == 1 && fwrite(&layout, sizeof(layout), 1, f) == 1 &&
+             fwrite(&s->image_lo, sizeof(s->image_lo), 1, f) == 1 &&
+             fwrite(&s->image_hi, sizeof(s->image_hi), 1, f) == 1 && fwrite(&portable, sizeof(portable), 1, f) == 1 &&
+             fwrite(&nregions, sizeof(nregions), 1, f) == 1;
+    /* region directory: name, size and address, in data order */
+    for (size_t i = 0; ok && i < NUM_REGIONS; ++i) {
+        const u8 len = (u8)strlen(sRegions[i].name);
+        const u32 size = (u32)sRegions[i].size;
+        ok = fwrite(&len, 1, 1, f) == 1 && fwrite(sRegions[i].name, 1, len, f) == len &&
+             fwrite(&size, sizeof(size), 1, f) == 1 && fwrite(&s->saved_bases[i], sizeof(u64), 1, f) == 1;
     }
-    /* heap/ROM pointer records: count, then region u16, kind u8, keyLen u8,
-     * at u32, offset u64, key bytes */
-    int ok = fwrite(&s->nrecs, sizeof(s->nrecs), 1, f) == 1;
+    /* pointer records: count, then region u16, kind u8, keyLen u8, at u32,
+     * offset u64, key bytes */
+    ok = ok && fwrite(&s->nrecs, sizeof(s->nrecs), 1, f) == 1;
     for (u32 k = 0; ok && k < s->nrecs; ++k) {
         const PtrRec* r = &s->recs[k];
         ok = fwrite(&r->region, sizeof(r->region), 1, f) == 1 && fwrite(&r->kind, 1, 1, f) == 1 &&
              fwrite(&r->keyLen, 1, 1, f) == 1 && fwrite(&r->at, sizeof(r->at), 1, f) == 1 &&
              fwrite(&r->offset, sizeof(r->offset), 1, f) == 1 && fwrite(r->key, 1, r->keyLen, f) == r->keyLen;
     }
-    if (!ok) {
-        fprintf(stderr, "[quicksave] pointer table write failed for %s\n", path);
-        fclose(f);
-        return 0;
-    }
-    const size_t written = fwrite(s->snapshot, 1, s->bytes, f);
+    ok = ok && fwrite(s->snapshot, 1, s->bytes, f) == s->bytes;
     fclose(f);
-    if (written != s->bytes) {
-        fprintf(stderr, "[quicksave] short write %s (%zu/%zu)\n", path, written, s->bytes);
-        return 0;
-    }
-    return 1;
+    if (!ok)
+        fprintf(stderr, "[quicksave] write failed for %s\n", path);
+    return ok;
 }
 
 /* Reads the fixed 4-field slot header (magic, version, total, saved_at).
@@ -700,104 +726,138 @@ static int ReadSlotHeader(FILE* f, u32* magic, u32* version, u32* total, u64* sa
            fread(total, sizeof(*total), 1, f) == 1 && fread(saved_at, sizeof(*saved_at), 1, f) == 1;
 }
 
+/* Loads a slot file into sSlots[slot], laid out for this build: regions are
+ * matched by name, so a state from another build loads as long as every
+ * region it shares with this one kept its size and every pointer it holds
+ * into code or constants was recorded by symbol. Regions this build added
+ * keep their current contents. */
 static int ReadSlotFromDisk(int slot) {
     if (slot < 0 || slot >= NUM_SLOTS)
         return 0;
+    TotalRegionBytes(); /* fills in the private-type region sizes */
     char path[64];
     SlotFilename(slot, path, sizeof(path));
     FILE* f = fopen(path, "rb");
     if (!f)
         return 0;
-    u32 magic = 0, version = 0, total = 0;
-    u64 saved_at = 0;
-    u64 saved_bases[NUM_REGIONS] = {0};
-    if (!ReadSlotHeader(f, &magic, &version, &total, &saved_at)) {
-        fprintf(stderr, "[quicksave] short read on %s header, ignoring slot file\n", path);
+    u32 magic = 0, version = 0, total = 0, region_tag = 0, portable = 0, nregions = 0;
+    u64 saved_at = 0, layout = 0, image_lo = 0, image_hi = 0;
+    if (!ReadSlotHeader(f, &magic, &version, &total, &saved_at) || magic != MAGIC || version != VERSION ||
+        fread(&region_tag, sizeof(region_tag), 1, f) != 1 || fread(&layout, sizeof(layout), 1, f) != 1 ||
+        fread(&image_lo, sizeof(image_lo), 1, f) != 1 || fread(&image_hi, sizeof(image_hi), 1, f) != 1 ||
+        fread(&portable, sizeof(portable), 1, f) != 1 || fread(&nregions, sizeof(nregions), 1, f) != 1 ||
+        nregions > 1024) {
         fclose(f);
         return 0;
     }
-    if (magic != MAGIC || version != VERSION || total != (u32)TotalRegionBytes()) {
+    if (region_tag != ActiveRegionTag()) {
+        fprintf(stderr, "[quicksave] %s was saved in a different ROM region (%u != %u) — refusing load\n", path,
+                region_tag, ActiveRegionTag());
         fclose(f);
         return 0;
     }
-    if (fread(saved_bases, sizeof(saved_bases), 1, f) != 1) {
-        fprintf(stderr, "[quicksave] short read on %s region-base header, ignoring slot file\n", path);
-        fclose(f);
-        return 0;
-    }
-    {
-        u32 region_tag = 0;
-        if (fread(&region_tag, sizeof(region_tag), 1, f) != 1) {
-            fprintf(stderr, "[quicksave] short read on %s region header, ignoring slot file\n", path);
-            fclose(f);
-            return 0;
-        }
-        if (region_tag != ActiveRegionTag()) {
-            fprintf(stderr, "[quicksave] %s was saved in a different ROM region (%u != %u) — refusing load\n", path,
-                    region_tag, ActiveRegionTag());
-            fclose(f);
-            return 0;
-        }
-    }
-    u64 layout = 0, image_lo = 0, image_hi = 0;
-    if (fread(&layout, sizeof(layout), 1, f) != 1 || fread(&image_lo, sizeof(image_lo), 1, f) != 1 ||
-        fread(&image_hi, sizeof(image_hi), 1, f) != 1) {
-        fprintf(stderr, "[quicksave] short read on %s build header, ignoring slot file\n", path);
-        fclose(f);
-        return 0;
-    }
-    if (layout != LayoutSignature()) {
+    const int sameBuild = layout == LayoutSignature();
+    if (!sameBuild && !(portable && Port_Syms_Available())) {
         /* Its pointers into code and constants belong to another build's
-         * layout; restoring it would crash on the first one followed. */
-        fprintf(stderr, "[quicksave] %s was saved by a different build of the game — refusing load\n", path);
+         * layout and weren't all named; restoring it would crash. */
+        fprintf(stderr, "[quicksave] %s was saved by a different build of the game%s — refusing load\n", path,
+                portable ? " and tmc_pc.syms is missing" : "");
         fclose(f);
         return 0;
+    }
+
+    /* directory -> this build's regions */
+    int map[1024];
+    u32 dsize[1024];
+    u64 dbase[1024];
+    int ok = 1;
+    for (u32 d = 0; ok && d < nregions; ++d) {
+        u8 len = 0;
+        char name[256];
+        ok = fread(&len, 1, 1, f) == 1 && fread(name, 1, len, f) == len && fread(&dsize[d], 4, 1, f) == 1 &&
+             fread(&dbase[d], 8, 1, f) == 1;
+        name[ok ? len : 0] = 0;
+        map[d] = -1;
+        for (size_t i = 0; ok && i < NUM_REGIONS; ++i)
+            if (strcmp(sRegions[i].name, name) == 0) {
+                if (sRegions[i].size != dsize[d]) {
+                    fprintf(stderr, "[quicksave] %s: %s changed size in this build (%u -> %zu) — refusing load\n",
+                            path, name, dsize[d], sRegions[i].size);
+                    fclose(f);
+                    return 0;
+                }
+                map[d] = (int)i;
+            }
     }
     u32 nrecs = 0;
     PtrRec* recs = NULL;
-    int ok = fread(&nrecs, sizeof(nrecs), 1, f) == 1 && nrecs < (1u << 20);
-    if (ok && nrecs) {
-        recs = (PtrRec*)calloc(nrecs, sizeof(PtrRec));
-        ok = recs != NULL;
-    }
+    ok = ok && fread(&nrecs, sizeof(nrecs), 1, f) == 1 && nrecs < (1u << 20);
+    if (ok && nrecs)
+        ok = (recs = (PtrRec*)calloc(nrecs, sizeof(PtrRec))) != NULL;
+    u32 kept = 0;
     for (u32 k = 0; ok && k < nrecs; ++k) {
-        PtrRec* r = &recs[k];
-        ok = fread(&r->region, sizeof(r->region), 1, f) == 1 && fread(&r->kind, 1, 1, f) == 1 &&
-             fread(&r->keyLen, 1, 1, f) == 1 && fread(&r->at, sizeof(r->at), 1, f) == 1 &&
-             fread(&r->offset, sizeof(r->offset), 1, f) == 1 && r->keyLen < sizeof(r->key) &&
-             fread(r->key, 1, r->keyLen, f) == r->keyLen;
+        PtrRec r;
+        memset(&r, 0, sizeof(r));
+        ok = fread(&r.region, sizeof(r.region), 1, f) == 1 && fread(&r.kind, 1, 1, f) == 1 &&
+             fread(&r.keyLen, 1, 1, f) == 1 && fread(&r.at, sizeof(r.at), 1, f) == 1 &&
+             fread(&r.offset, sizeof(r.offset), 1, f) == 1 && r.keyLen < sizeof(r.key) &&
+             fread(r.key, 1, r.keyLen, f) == r.keyLen && r.region < nregions;
+        if (ok && map[r.region] >= 0) {
+            r.region = (u16)map[r.region];
+            recs[kept++] = r;
+        }
     }
     if (!ok) {
-        fprintf(stderr, "[quicksave] short read on %s pointer table, ignoring slot file\n", path);
+        fprintf(stderr, "[quicksave] short read on %s, ignoring slot file\n", path);
         free(recs);
         fclose(f);
         return 0;
     }
+
+    /* data, laid out in this build's order; regions the file lacks keep
+     * their current contents */
     Slot* s = &sSlots[slot];
-    free(s->recs);
-    s->recs = recs, s->nrecs = nrecs;
-    if (s->snapshot == NULL || s->bytes != total) {
+    const size_t mine = TotalRegionBytes();
+    if (s->snapshot == NULL || s->bytes != mine) {
         free(s->snapshot);
-        s->snapshot = (u8*)malloc(total);
+        s->snapshot = (u8*)malloc(mine);
         if (!s->snapshot) {
-            s->bytes = 0;
-            s->valid = 0;
+            s->bytes = 0, s->valid = 0;
+            free(recs);
             fclose(f);
             return 0;
         }
-        s->bytes = total;
+        s->bytes = mine;
     }
-    const size_t got = fread(s->snapshot, 1, total, f);
+    size_t at[1024];
+    for (size_t i = 0, o = 0; i < NUM_REGIONS; o += sRegions[i].size, ++i) {
+        at[i] = o;
+        memcpy(s->snapshot + o, sRegions[i].ptr, sRegions[i].size);
+        s->saved_bases[i] = (u64)(uintptr_t)sRegions[i].ptr; /* no relocation unless the file has it */
+    }
+    for (u32 d = 0; ok && d < nregions; ++d) {
+        if (map[d] < 0) {
+            ok = fseek(f, (long)dsize[d], SEEK_CUR) == 0;
+            continue;
+        }
+        ok = fread(s->snapshot + at[map[d]], 1, dsize[d], f) == dsize[d];
+        s->saved_bases[map[d]] = dbase[d];
+    }
     fclose(f);
-    if (got != total) {
-        fprintf(stderr, "[quicksave] short read on %s (%zu/%u bytes), ignoring slot file\n", path, got, total);
+    if (!ok) {
+        fprintf(stderr, "[quicksave] short read on %s data, ignoring slot file\n", path);
+        free(recs);
         s->valid = 0;
         return 0;
     }
+    free(s->recs);
+    s->recs = recs, s->nrecs = kept;
+    s->portable = (int)portable;
     s->valid = 1;
     s->saved_at_unix = saved_at;
-    memcpy(s->saved_bases, saved_bases, sizeof(saved_bases));
     s->image_lo = image_lo, s->image_hi = image_hi;
+    if (!sameBuild)
+        fprintf(stderr, "[quicksave] %s is from another build; loading by region and symbol names\n", path);
     return 1;
 }
 
