@@ -365,6 +365,10 @@ void Port_ReproNpcTalk_Tick(unsigned int frame) {
                 Port_Voxel_RequestShot(path);
                 snprintf(path, sizeof(path), "%s/2d.png", shot);
                 Port_CaptureBaseFramebufferPNG(path);
+                if (getenv("TMC_VOXEL_SHOT_SAVE")) { /* and a state in slot 1, for load repros */
+                    extern int Port_QuickSave_SaveSlot(int slot);
+                    Port_QuickSave_SaveSlot(1);
+                }
                 fprintf(stderr, "[voxshot] area=0x%02x room=0x%02x scroll=%d,%d\n", gRoomControls.area,
                         gRoomControls.room, gRoomControls.scroll_x - gRoomControls.origin_x,
                         gRoomControls.scroll_y - gRoomControls.origin_y);

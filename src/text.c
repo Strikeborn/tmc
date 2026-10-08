@@ -56,6 +56,10 @@ typedef struct {
 
 #ifdef PC_PORT
 struct_gUnk_02034330 gUnk_02034330;
+#ifdef PC_PORT
+/* Size for save states (port/port_quicksave_regions.h): the type is private here. */
+const unsigned gQsSize_gUnk_02034330 = sizeof(gUnk_02034330);
+#endif
 WStruct gUnk_02036540[4];
 #else
 extern struct_gUnk_02034330 gUnk_02034330;

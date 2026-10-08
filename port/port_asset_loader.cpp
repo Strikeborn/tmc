@@ -14,6 +14,7 @@ extern "C" {
 #include "port_asset_index.h"
 #include "structures.h"
 #include "area.h"
+#include "port_ptr_registry.h"
 #undef this
 
 extern RoomHeader* gAreaRoomHeaders[];
@@ -809,6 +810,12 @@ void ParseTexts(const nlohmann::json& root) {
     }
 }
 
+/* Save states record pointers into cached blobs by name (port_ptr_registry). */
+void RegisterFileBlock(const std::string& key, const std::vector<u8>* data) {
+    if (data != nullptr && !data->empty())
+        Port_PtrBlock_Register(("file:" + key).c_str(), data->data(), data->size());
+}
+
 const std::vector<u8>* LoadBinaryFileCached(const std::string& relativePath) {
     auto it = gAssetGroupCache.binaryFiles.find(relativePath);
     if (it != gAssetGroupCache.binaryFiles.end()) {
@@ -827,6 +834,7 @@ const std::vector<u8>* LoadBinaryFileCached(const std::string& relativePath) {
         if (data) {
             const std::vector<u8>* result = data.get();
             gAssetGroupCache.binaryFiles.emplace(relativePath, std::move(data));
+            RegisterFileBlock(relativePath, result);
             AssetLogOnce("mod-file:" + normalizedPath, "mod override %s <- %s", normalizedPath.c_str(),
                          PathForLog(modIt->second).c_str());
             return result;
@@ -846,6 +854,7 @@ const std::vector<u8>* LoadBinaryFileCached(const std::string& relativePath) {
             auto data = std::make_unique<std::vector<u8>>(bytes->begin(), bytes->end());
             const std::vector<u8>* result = data.get();
             gAssetGroupCache.binaryFiles.emplace(relativePath, std::move(data));
+            RegisterFileBlock(relativePath, result);
             return result;
         }
     }
@@ -857,6 +866,7 @@ const std::vector<u8>* LoadBinaryFileCached(const std::string& relativePath) {
     }
     const std::vector<u8>* result = data.get();
     gAssetGroupCache.binaryFiles.emplace(relativePath, std::move(data));
+    RegisterFileBlock(relativePath, result);
     return result;
 }
 
@@ -902,6 +912,9 @@ MapDataDefinition* BuildMapDefinitionSequence(const std::vector<MapDefinitionRef
     defs[refs.size() - 1].src &= ~static_cast<u32>(MAP_MULTIPLE);
 
     MapDataDefinition* result = defs.get();
+    char key[48];
+    std::snprintf(key, sizeof(key), "mapdefs:%u:%zu", area, gAssetGroupCache.mapDefStorage[area].size());
+    Port_PtrBlock_Register(key, result, refs.size() * sizeof(MapDataDefinition));
     gAssetGroupCache.mapDefStorage[area].push_back(std::move(defs));
     return result;
 }
@@ -917,6 +930,16 @@ bool BuildAreaFromAssets(u32 area) {
     gAssetGroupCache.areaPropertyStorage[area].clear();
     gAssetGroupCache.mapDefStorage[area].clear();
     gAssetGroupCache.areaTilesPtrs[area] = nullptr;
+    for (const char* kind : { "mapdefs", "props", "areatbl", "tilesets", "roommaps" }) {
+        char prefix[32];
+        std::snprintf(prefix, sizeof(prefix), "%s:%u:", kind, area);
+        Port_PtrBlock_UnregisterPrefix(prefix);
+    }
+    auto registerArray = [area](const char* kind, const void* data, size_t bytes) {
+        char key[48];
+        std::snprintf(key, sizeof(key), "%s:%u:", kind, area);
+        Port_PtrBlock_Register(key, data, bytes);
+    };
 
     if (!gAssetGroupCache.areaRoomHeaders[area].empty()) {
         gAreaRoomHeaders[area] = gAssetGroupCache.areaRoomHeaders[area].data();
@@ -947,6 +970,7 @@ bool BuildAreaFromAssets(u32 area) {
     if (!gAssetGroupCache.areaTileSets[area].empty()) {
         gAreaTileSets[area] = gAssetGroupCache.areaTileSetPtrs[area].data();
     }
+    registerArray("tilesets", gAssetGroupCache.areaTileSetPtrs[area].data(), tileSetSlots * sizeof(void*));
 
     const size_t roomMapSlots = std::max<size_t>(gAssetGroupCache.areaRoomMaps[area].size(), 64);
     gAssetGroupCache.areaRoomMapPtrs[area].assign(roomMapSlots, nullptr);
@@ -957,6 +981,7 @@ bool BuildAreaFromAssets(u32 area) {
     if (!gAssetGroupCache.areaRoomMaps[area].empty()) {
         gAreaRoomMaps[area] = gAssetGroupCache.areaRoomMapPtrs[area].data();
     }
+    registerArray("roommaps", gAssetGroupCache.areaRoomMapPtrs[area].data(), roomMapSlots * sizeof(void*));
 
     /* areaTiles[area] is a single pointer (not a sub-array). If the
      * source was empty BuildMapDefinitionSequence returns nullptr; same
@@ -1058,8 +1083,14 @@ bool BuildAreaFromAssets(u32 area) {
         }
 
         gAssetGroupCache.areaTablePtrs[area][room] = props.get();
+        {
+            char key[48];
+            std::snprintf(key, sizeof(key), "props:%u:%zu", area, room);
+            Port_PtrBlock_Register(key, props.get(), propertySlots * sizeof(void*));
+        }
         gAssetGroupCache.areaPropertyStorage[area][room] = std::move(props);
     }
+    registerArray("areatbl", gAssetGroupCache.areaTablePtrs[area].data(), areaTableSlots * sizeof(void*));
     /* Same preservation rule as the tile/map tables above: jsonTables
      * is the SOURCE — when empty (no extracted area-tables JSON for this
      * area, e.g. Lake Hylia) the padded all-nullptr slot vector must NOT
@@ -1070,6 +1101,22 @@ bool BuildAreaFromAssets(u32 area) {
 
     return true;
 }
+
+/* Builds the block a save state names, when this process hasn't yet: a cached
+ * file by path, or an area's tables. An area that is already built is never
+ * rebuilt here (live game state points into it). */
+int LoadPtrBlock(const char* key) {
+    if (std::strncmp(key, "file:", 5) == 0)
+        return LoadBinaryFileCached(key + 5) != nullptr;
+    unsigned area = 0;
+    const char* colon = std::strchr(key, ':');
+    if (colon == nullptr || std::sscanf(colon + 1, "%u", &area) != 1 || area >= kAreaCount)
+        return 0;
+    if (!gAssetGroupCache.areaTablePtrs[area].empty())
+        return 0;
+    return BuildAreaFromAssets(area) ? 1 : 0;
+}
+const bool kPtrBlockLoaderSet = (Port_PtrBlock_SetLoader(&LoadPtrBlock), true);
 
 void RefreshSprite322DerivedTables() {
     memset(gMoreSpritePtrs, 0, sizeof(u16*) * 16);
@@ -1704,6 +1751,7 @@ extern "C" bool32 Port_LoadSpritePtrsFromAssets(void) {
             }
 
             const u8* paddedPtr = buf->data();
+            RegisterFileBlock(paddedKey, buf.get());
             gAssetGroupCache.binaryFiles.emplace(std::move(paddedKey), std::move(buf));
             animPtrs.push_back(paddedPtr);
         }

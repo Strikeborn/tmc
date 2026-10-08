@@ -292,6 +292,12 @@ typedef struct {
 } MessageChoices;
 #ifdef PC_PORT
 MessageChoices gMessageChoices;
+#ifdef PC_PORT
+/* Size for save states (port/port_quicksave_regions.h): the type is private here. */
+const unsigned gQsSize_gMessageChoices = sizeof(gMessageChoices);
+const unsigned gQsSize_gCurrentWindow = sizeof(gCurrentWindow);
+const unsigned gQsSize_gNewWindow = sizeof(gNewWindow);
+#endif
 #else
 extern MessageChoices gMessageChoices;
 #endif

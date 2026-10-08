@@ -744,6 +744,7 @@ target("tmc_pc")
     add_files("port/port_asset_index.c")
     add_files("port/port_update_check.c")
     add_files("port/port_asset_loader.cpp")
+    add_files("port/port_ptr_registry.c")  -- named heap blocks for portable save states
     add_files("port/port_asset_pipeline.cpp")
     add_files("port/port_asset_log.cpp")
     add_files("port/port_asset_pak.cpp")

@@ -27,6 +27,10 @@ typedef struct Temp {
 
 #ifdef PC_PORT
 Temp gUnk_02033290[32] __attribute__((aligned(8)));
+#ifdef PC_PORT
+/* Size for save states (port/port_quicksave_regions.h): the type is private here. */
+const unsigned gQsSize_gUnk_02033290 = sizeof(gUnk_02033290);
+#endif
 #endif
 #ifdef PC_PORT
 #include "port_entity_ctx.h"
