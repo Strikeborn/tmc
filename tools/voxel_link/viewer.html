@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voxel Link</title>
+<style>
+  :root { --bg: #1d2a1f; --fg: #e8efe6; --panel: rgba(0,0,0,.45); --accent: #9fdc6c; }
+  @media (prefers-color-scheme: light) { :root { --bg: #dfe9d8; --fg: #1d2a1f; --panel: rgba(255,255,255,.7); --accent: #3c7a1c; } }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 14px system-ui, sans-serif; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+  #ui { position: fixed; left: 16px; top: 16px; right: 16px; max-width: 420px; background: var(--panel); padding: 12px; border-radius: 8px; }
+  #ui label { margin-right: 12px; white-space: nowrap; }
+  #ui p { margin: 8px 0 0; opacity: .8; }
+  button, select { font: inherit; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <label>Pose <select id="pose"></select></label>
+  <label><input type="checkbox" id="play" checked> Animate</label>
+  <label>Step <span id="step">0</span></label>
+  <p>Drag to orbit, wheel to zoom. Carved from Link's front, back and side sprites.</p>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+const MODELS = /*MODELS*/null;
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(devicePixelRatio);
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(getComputedStyle(document.documentElement).getPropertyValue('--bg').trim());
+const camera = new THREE.PerspectiveCamera(35, 1, 1, 1000);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x445544, 0.9));
+const sun = new THREE.DirectionalLight(0xffffff, 0.6); sun.position.set(40, 80, 60); scene.add(sun);
+const ground = new THREE.Mesh(new THREE.CircleGeometry(24, 48), new THREE.MeshLambertMaterial({ color: 0x4f7d3a }));
+ground.rotation.x = -Math.PI / 2; ground.position.y = -0.5; scene.add(ground);
+
+const poseSel = document.getElementById('pose');
+for (const k of Object.keys(MODELS)) poseSel.add(new Option(k, k));
+const box = new THREE.BoxGeometry(1, 1, 1);
+const mat = new THREE.MeshLambertMaterial();
+let mesh = null, step = 0, last = 0;
+function show(pose, s) {
+  const seq = MODELS[pose]; s = s % seq.length; const v = seq[s];
+  if (mesh) { scene.remove(mesh); mesh.dispose(); }
+  mesh = new THREE.InstancedMesh(box, mat, v.length);
+  const m = new THREE.Matrix4(), c = new THREE.Color();
+  v.forEach((p, i) => {
+    m.makeTranslation(p[0], p[1], p[2]); mesh.setMatrixAt(i, m);
+    c.setRGB(p[3] / 255, p[4] / 255, p[5] / 255); mesh.setColorAt(i, c);
+  });
+  scene.add(mesh);
+  document.getElementById('step').textContent = s + 1 + ' / ' + seq.length;
+}
+poseSel.onchange = () => { step = 0; show(poseSel.value, 0); };
+
+let yaw = 0.6, pitch = 0.35, dist = 90, drag = null;
+addEventListener('pointerdown', e => { if (e.target === renderer.domElement) drag = [e.clientX, e.clientY]; });
+addEventListener('pointerup', () => drag = null);
+addEventListener('pointermove', e => {
+  if (!drag) return;
+  yaw -= (e.clientX - drag[0]) * 0.01; pitch = Math.max(-0.2, Math.min(1.4, pitch + (e.clientY - drag[1]) * 0.01));
+  drag = [e.clientX, e.clientY];
+});
+addEventListener('wheel', e => { dist = Math.max(30, Math.min(250, dist * Math.pow(1.001, e.deltaY))); });
+function resize() { renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); }
+addEventListener('resize', resize); resize();
+show(poseSel.value, 0);
+function frame(t) {
+  if (document.getElementById('play').checked && t - last > 110) { last = t; step++; show(poseSel.value, step); }
+  camera.position.set(Math.sin(yaw) * Math.cos(pitch) * dist, 14 + Math.sin(pitch) * dist, Math.cos(yaw) * Math.cos(pitch) * dist);
+  camera.lookAt(0, 14, 0);
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

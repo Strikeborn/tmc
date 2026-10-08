@@ -47,6 +47,7 @@ typedef struct {
     int16_t trueY;   /* then a placeholder off the 2D screen */
     uint8_t parked;
     int16_t anchorX; /* screen X of the entity: its pieces turn round it */
+    uint8_t player;  /* drawn for Link himself (frame recorder) */
 } PortVoxelOamTag;
 extern PortVoxelOamTag gPortVoxelOamTagsBuild[128];
 extern PortVoxelOamTag gPortVoxelOamTags[128];

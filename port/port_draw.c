@@ -933,6 +933,10 @@ static void ProcessEntityForDraw(Entity* entity) {
     sVoxelCtx.layer = entity->collisionLayer;
     sVoxelCtx.groundY = (s16)(y - entity->z.HALF.HI);
     sVoxelCtx.anchorX = (s16)x;
+    {
+        extern PlayerEntity gPlayerEntity;
+        sVoxelCtx.player = entity == &gPlayerEntity.base;
+    }
 
     /* Check shadow flag (bit 3 of spritePriority byte, offset 0x29) */
     s8 prioRaw = *(s8*)&entity->spritePriority;

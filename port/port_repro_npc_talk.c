@@ -321,6 +321,26 @@ void Port_ReproNpcTalk_Tick(unsigned int frame) {
      * settle, write <dir>/3d.png (3D view) and <dir>/2d.png (GBA frame), then
      * exit. Pair with TMC_VOXEL_YAW / TMC_VOXEL_PITCH for other angles. */
     {
+        /* ponytail: debug knob — TMC_LINK_POSES=1 (with TMC_LINK_FRAMES): walk,
+         * stand and swing in each direction so the frame recorder sees every
+         * basic pose, then exit. */
+        if (getenv("TMC_LINK_POSES")) {
+            static unsigned int since = 0;
+            static const int kDirs[4] = { PORT_INPUT_DOWN, PORT_INPUT_RIGHT, PORT_INPUT_UP, PORT_INPUT_LEFT };
+            if (since == 0)
+                since = frame;
+            gSave.stats.health = gSave.stats.maxHealth;
+            const unsigned int t = frame - since, phase = t % 200, d = t / 200;
+            if (d >= 8) { /* twice round: the second pass catches frames the first started mid-way */
+                fflush(stderr);
+                _Exit(0);
+            }
+            if (phase < 70)
+                Port_Config_TestForceEdge(kDirs[d % 4]); /* walk */
+            else if (phase == 110 || phase == 150)
+                Port_Config_TestForceEdge(PORT_INPUT_B); /* swing */
+            return;
+        }
         const char* shot = getenv("TMC_VOXEL_SHOT");
         if (shot && *shot) {
             static unsigned int since = 0;

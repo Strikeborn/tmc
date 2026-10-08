@@ -81,6 +81,7 @@ extern "C" {
 #include "screen.h"
 #include "message.h"
 #undef this
+#include "port_asset_loader.h"
 #include "port_debug_menu.h"
 #include "port_gba_mem.h"
 #include "port_imgui_menu.h"
@@ -1387,6 +1388,110 @@ bool DecodeObj(int i, bool obj1d, ObjRect& o) {
     return true;
 }
 
+/* ponytail: debug knob — TMC_LINK_FRAMES=<dir>: every distinct picture of
+ * Link (his own OAM pieces, composed on a 64x64 canvas with his feet at
+ * (32, 52)) is written once as <dir>/link_<n>.png, with its animation in
+ * <dir>/frames.jsonl. Input for the voxel-Link builder (tools/voxel_link). */
+constexpr int kRecW = 64, kRecH = 64, kRecFootX = 32, kRecFootY = 52;
+
+bool WriteRgbaPng(const char* path, const Uint8* rgba, int w, int h) {
+    FILE* fp = std::fopen(path, "wb");
+    png_structp png = fp ? png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr) : nullptr;
+    png_infop info = png ? png_create_info_struct(png) : nullptr;
+    bool ok = false;
+    if (info && !setjmp(png_jmpbuf(png))) {
+        png_init_io(png, fp);
+        png_set_IHDR(png, info, w, h, 8, PNG_COLOR_TYPE_RGBA, PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT,
+                     PNG_FILTER_TYPE_DEFAULT);
+        png_write_info(png, info);
+        for (int y = 0; y < h; ++y)
+            png_write_row(png, rgba + (size_t)y * w * 4);
+        png_write_end(png, nullptr);
+        ok = true;
+    }
+    if (png)
+        png_destroy_write_struct(&png, info ? &info : nullptr);
+    if (fp)
+        std::fclose(fp);
+    return ok;
+}
+
+void RecordLinkFrame(bool obj1d) {
+    static const char* dir = std::getenv("TMC_LINK_FRAMES");
+    if (!dir || !*dir)
+        return;
+    static Uint8 canvas[kRecW * kRecH * 4];
+    std::memset(canvas, 0, sizeof(canvas));
+    int pieces = 0, anchorX = 0, groundY = 0;
+    for (int i = 127; i >= 0; --i) { /* lower OAM index on top */
+        const PortVoxelOamTag& tag = gPortVoxelOamTags[i];
+        if (tag.kind != PORT_VOXEL_OAM_ENTITY || !tag.player)
+            continue;
+        ObjRect o;
+        const u16 a0 = gOamMem[i * 4], a1 = gOamMem[i * 4 + 1];
+        if ((a0 & 0x100) || !DecodeObj(i, obj1d, o)) /* affine pieces: skip */
+            continue;
+        if (tag.parked)
+            o.x = tag.trueX, o.y = tag.trueY;
+        anchorX = tag.anchorX, groundY = tag.groundY, ++pieces;
+        const bool hf = (a1 & 0x1000) != 0, vf = (a1 & 0x2000) != 0, b8 = (o.rowParam & 256) != 0;
+        const int perRow = (int)(o.rowParam & 255);
+        for (int py = 0; py < o.sh; ++py)
+            for (int px = 0; px < o.sw; ++px) {
+                const int cx = o.x + px - tag.anchorX + kRecFootX, cy = o.y + py - tag.groundY + kRecFootY;
+                if (cx < 0 || cy < 0 || cx >= kRecW || cy >= kRecH)
+                    continue;
+                const int tx = hf ? o.sw - 1 - px : px, ty = vf ? o.sh - 1 - py : py;
+                const int tile = (int)o.tile + (ty / 8) * perRow + (tx / 8) * (b8 ? 2 : 1);
+                const Uint32 addr = 0x10000u + (Uint32)(tile & 0x3FF) * 32u;
+                int idx;
+                if (b8) {
+                    idx = gVram[(addr + (ty % 8) * 8 + tx % 8) % sizeof(gVram)];
+                } else {
+                    const Uint8 b = gVram[(addr + (ty % 8) * 4 + (tx % 8) / 2) % sizeof(gVram)];
+                    idx = (tx & 1) ? b >> 4 : b & 15;
+                    if (idx)
+                        idx += (int)o.pal * 16;
+                }
+                if (!idx)
+                    continue;
+                const u16 c = gObjPltt[idx & 255];
+                Uint8* d = &canvas[(cy * kRecW + cx) * 4];
+                d[0] = (Uint8)((c & 31) * 255 / 31);
+                d[1] = (Uint8)(((c >> 5) & 31) * 255 / 31);
+                d[2] = (Uint8)(((c >> 10) & 31) * 255 / 31);
+                d[3] = 255;
+            }
+    }
+    if (!pieces)
+        return;
+    Uint64 h = 1469598103934665603ull;
+    for (Uint8 b : canvas)
+        h = (h ^ b) * 1099511628211ull;
+    static std::map<Uint64, int> seen;
+    if (seen.count(h))
+        return;
+    const int n = (int)seen.size();
+    seen[h] = n;
+    char path[512];
+    std::snprintf(path, sizeof(path), "%s/link_%04d.png", dir, n);
+    if (!WriteRgbaPng(path, canvas, kRecW, kRecH))
+        return;
+    const Entity& p = gPlayerEntity.base;
+    const u8* anim = Port_GetSpriteAnimationData((u16)p.spriteIndex, p.animIndex);
+    const int step = anim && p.animPtr ? (int)(((const u8*)p.animPtr - anim) / 4) - 1 : -1;
+    std::snprintf(path, sizeof(path), "%s/frames.jsonl", dir);
+    if (FILE* f = std::fopen(path, "a")) {
+        std::fprintf(f,
+                     "{\"file\": \"link_%04d.png\", \"sprite\": %d, \"anim\": %d, \"frame\": %d, \"step\": %d, "
+                     "\"state\": %d, \"flip\": %d, \"player_anim\": %d, \"pieces\": %d}\n",
+                     n, p.spriteIndex, p.animIndex, p.frameIndex, step, p.animationState, p.spriteSettings.flipX,
+                     gPlayerState.animation, pieces);
+        std::fclose(f);
+    }
+    (void)anchorX, (void)groundY;
+}
+
 } // namespace
 
 int Port_Voxel_CurrentArea(void) {
@@ -1629,6 +1734,7 @@ static bool PresentImpl(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* swap, int swa
         QuadUv(sVerts, kMaxVerts, n, c, o.uv, 1, o.tile, o.pal, o.rowParam);
     }
     const int worldVerts = n;
+    RecordLinkFrame(obj1d);
 
     /* HUD: BG0 (text boxes, banners) then HUD sprites, in GBA screen pixels.
      * BG0 goes through the real PPU line renderer so the widescreen HUD
